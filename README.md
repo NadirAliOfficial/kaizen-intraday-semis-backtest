@@ -283,3 +283,4 @@ IBKR_PORT = 7497
 
 **Strategy validated. System ready. Trade safe.** 🎯
 <!-- updated: 2025-12-08 -->
+
