@@ -1,2 +1,3 @@
-# kaizen-intraday-semis-backtest
-Mechanical intraday backtest for SMH and SOXX using progressive entry, VIX-scaled leverage, and strict end-of-day flat rules.
+This repository contains a fully mechanical intraday backtest implementation of the KAIZEN_INTRADAY_SEMIS strategy.
+The system trades SMH and SOXX based on intraday momentum confirmation, progressive position scaling, and volatility-aware leverage.
+All positions are opened and closed within regular US market hours with no overnight exposure.

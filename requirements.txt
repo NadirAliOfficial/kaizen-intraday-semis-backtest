@@ -1,0 +1,4 @@
+pandas
+numpy
+ib_insync
+pytz
