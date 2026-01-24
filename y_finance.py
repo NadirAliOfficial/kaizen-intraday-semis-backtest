@@ -3,9 +3,9 @@ import pandas as pd
 import numpy as np
 import pytz
 from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
 
 # ================== CONFIG ==================
+BAR_SIZE = "5m"
 TIMEZONE = pytz.timezone("America/New_York")
 
 ENTRY_1 = 0.0012
@@ -17,27 +17,30 @@ DAILY_KILL = -0.025
 
 # ============================================
 
-def fetch_daily_data(symbol, start_date, end_date):
-    """Fetch daily data from Yahoo Finance"""
+def fetch_yfinance_intraday(symbol, lookback_days=60):
+    """Fetch 5-minute intraday data from Yahoo Finance"""
     print(f"Fetching {symbol}...")
     
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date, interval="1d")
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+        
+        df = ticker.history(start=start_date, end=end_date, interval=BAR_SIZE, prepost=False)
         
         if df.empty:
             print(f"  ❌ No data for {symbol}")
             return None
         
         df = df.reset_index()
-        df = df.rename(columns={'Date': 'date', 'Open': 'open', 'Close': 'close'})
+        df = df.rename(columns={'Datetime': 'date', 'Open': 'open', 'Close': 'close'})
         
         if df['date'].dt.tz is None:
-            df['date'] = pd.to_datetime(df['date']).dt.tz_localize(TIMEZONE)
+            df['date'] = df['date'].dt.tz_localize('UTC').dt.tz_convert(TIMEZONE)
         else:
-            df['date'] = pd.to_datetime(df['date']).dt.tz_convert(TIMEZONE)
+            df['date'] = df['date'].dt.tz_convert(TIMEZONE)
         
-        print(f"  ✓ {len(df)} days")
+        print(f"  ✓ {len(df)} bars ({df['date'].dt.date.nunique()} days)")
         return df[['date', 'open', 'close']]
         
     except Exception as e:
@@ -45,218 +48,382 @@ def fetch_daily_data(symbol, start_date, end_date):
         return None
 
 
-def compute_daily_ret(df):
-    """Calculate daily returns from open to close"""
+def compute_intraday_ret(df):
+    """Calculate intraday returns from day's open"""
     df = df.copy()
-    df["RET"] = (df["close"] - df["open"]) / df["open"]
+    df["day"] = df["date"].dt.date
+    df["day_open"] = df.groupby("day")["open"].transform("first")
+    df["RET"] = (df["close"] - df["day_open"]) / df["day_open"]
+    
+    # Calculate persistence
+    df["positive"] = df["RET"] > 0
+    df["negative"] = df["RET"] < 0
+    df["pos_streak"] = df.groupby(["day", (df["positive"] != df["positive"].shift()).cumsum()])["positive"].cumsum() * 5
+    df["neg_streak"] = df.groupby(["day", (df["negative"] != df["negative"].shift()).cumsum()])["negative"].cumsum() * 5
+    df["LONG_PERSISTENCE_MIN"] = df["pos_streak"]
+    df["SHORT_PERSISTENCE_MIN"] = df["neg_streak"]
+    
     return df
 
 
-def run_backtest(data):
-    rows = []
+def run_backtest_correct(data, initial_capital=100000):
+    """
+    CORRECTED backtest with proper position tracking
     
-    for _, r in data.iterrows():
-        SMH_RET = r["SMH_RET"]
-        SOXX_RET = r["SOXX_RET"]
-        QQQ_RET = r["QQQ_RET"]
-        VIX = r["VIX_close"]
+    KEY FIX:
+    - Track entry price when opening position
+    - Calculate PnL based on current price vs entry price
+    - Only realize PnL when position changes or closes
+    """
+    
+    capital = initial_capital
+    daily_results = []
+    bar_results = []
+    
+    # Group by day
+    for day, day_data in data.groupby(data['date'].dt.date):
+        day_start_capital = capital
+        day_realized_pnl = 0.0
         
-        # Detect mode
-        if SMH_RET > 0 and SOXX_RET > 0:
-            mode = "LONG"
-        elif SMH_RET < 0 and SOXX_RET < 0:
-            mode = "SHORT"
-        else:
-            mode = "NEUTRAL"
+        # State for this day
+        state = {
+            "mode": "NEUTRAL",
+            "pf": 0.0,
+            "trading": True,
+            "position_open": False,
+            "entry_price": 0.0,
+            "entry_symbol": None,
+            "entry_size": 0.0,
+            "current_leverage": 0.0
+        }
         
-        if mode == "NEUTRAL":
-            pf = 0.0
-            asset_ret = 0.0
-        else:
-            asset_ret = max(SMH_RET, SOXX_RET) if mode == "LONG" else min(SMH_RET, SOXX_RET)
+        # Process each bar
+        for idx, bar in day_data.iterrows():
+            SMH_RET = bar["SMH_RET"]
+            SOXX_RET = bar["SOXX_RET"]
+            QQQ_RET = bar["QQQ_RET"]
+            VIX = bar["VIX_close"]
+            LONG_PERSIST = bar["LONG_PERSISTENCE_MIN"]
+            SHORT_PERSIST = bar["SHORT_PERSISTENCE_MIN"]
+            
+            # Kill switch
+            if day_realized_pnl / day_start_capital <= DAILY_KILL:
+                # Close position if open
+                if state["position_open"]:
+                    exit_price = bar[f"{state['entry_symbol']}_close"]
+                    if state["mode"] == "LONG":
+                        pnl = state["entry_size"] * (exit_price - state["entry_price"]) / state["entry_price"]
+                    else:  # SHORT
+                        pnl = state["entry_size"] * (state["entry_price"] - exit_price) / state["entry_price"]
+                    day_realized_pnl += pnl
+                    state["position_open"] = False
+                
+                state["trading"] = False
+                state["pf"] = 0.0
+            
+            # Detect mode
+            prev_mode = state["mode"]
+            if state["trading"]:
+                if SMH_RET > 0 and SOXX_RET > 0:
+                    state["mode"] = "LONG"
+                elif SMH_RET < 0 and SOXX_RET < 0:
+                    state["mode"] = "SHORT"
+                else:
+                    state["mode"] = "NEUTRAL"
+                
+                if state["mode"] == "NEUTRAL":
+                    state["pf"] = 0.0
+            
+            # Select asset
+            if state["mode"] == "LONG":
+                asset_ret = max(SMH_RET, SOXX_RET)
+                asset_symbol = "SMH" if SMH_RET >= SOXX_RET else "SOXX"
+            elif state["mode"] == "SHORT":
+                asset_ret = min(SMH_RET, SOXX_RET)
+                asset_symbol = "SMH" if SMH_RET <= SOXX_RET else "SOXX"
+            else:
+                asset_ret = 0.0
+                asset_symbol = None
+            
+            pf = state["pf"]
             
             # Progressive entry
-            pf = 0.0
-            if mode == "LONG":
+            if state["mode"] == "LONG":
                 if asset_ret >= ENTRY_3:
                     pf = 1.0
                 elif asset_ret >= ENTRY_2:
-                    pf = 0.7
+                    pf = max(pf, 0.7)
                 elif asset_ret >= ENTRY_1:
-                    pf = 0.5
+                    pf = max(pf, 0.5)
             
-            if mode == "SHORT":
+            if state["mode"] == "SHORT":
                 if asset_ret <= -ENTRY_3:
                     pf = 1.0
                 elif asset_ret <= -ENTRY_2:
-                    pf = 0.7
+                    pf = max(pf, 0.7)
                 elif asset_ret <= -ENTRY_1:
-                    pf = 0.5
+                    pf = max(pf, 0.5)
             
-            # Invalidation / hard exit
-            if mode == "LONG" and asset_ret <= INVALID_ZERO:
-                pf *= 0.5
-            if mode == "SHORT" and asset_ret >= INVALID_ZERO:
-                pf *= 0.5
+            # Anti-churn
+            if state["mode"] == "LONG" and 0.003 <= QQQ_RET <= 0.007 and LONG_PERSIST >= 30:
+                pf = max(pf, 0.5)
+            if state["mode"] == "SHORT" and -0.007 <= QQQ_RET <= -0.003 and SHORT_PERSIST >= 30:
+                pf = max(pf, 0.5)
             
-            if mode == "LONG" and asset_ret <= -HARD_EXIT:
+            # Invalidation
+            if state["mode"] == "LONG" and asset_ret <= INVALID_ZERO:
+                pf = max(pf * 0.5, 0.0)
+            if state["mode"] == "SHORT" and asset_ret >= INVALID_ZERO:
+                pf = max(pf * 0.5, 0.0)
+            
+            if state["mode"] == "LONG" and asset_ret <= -HARD_EXIT:
                 pf = 0.0
-            if mode == "SHORT" and asset_ret >= HARD_EXIT:
+            if state["mode"] == "SHORT" and asset_ret >= HARD_EXIT:
                 pf = 0.0
+            
+            # Leverage (CONSERVATIVE)
+            base_leverage = 0.0
+            if state["mode"] == "LONG":
+                if VIX < 12:
+                    base_leverage = 2.0
+                elif VIX < 15:
+                    base_leverage = 1.5
+                else:
+                    base_leverage = 1.0
+            
+            if state["mode"] == "SHORT":
+                if VIX < 20:
+                    base_leverage = 1.0
+                elif VIX < 25:
+                    base_leverage = 1.5
+                else:
+                    base_leverage = 2.0
+            
+            target_leverage = base_leverage * pf
+            state["pf"] = pf
+            
+            # CRITICAL: Position Management Logic
+            bar_pnl = 0.0
+            unrealized_pnl = 0.0
+            
+            # Calculate unrealized PnL if position is open
+            if state["position_open"]:
+                current_price = bar[f"{state['entry_symbol']}_close"]
+                if state["mode"] == "LONG":
+                    unrealized_pnl = state["entry_size"] * (current_price - state["entry_price"]) / state["entry_price"]
+                else:  # SHORT
+                    unrealized_pnl = state["entry_size"] * (state["entry_price"] - current_price) / state["entry_price"]
+            
+            # Check if we need to close or adjust position
+            mode_changed = prev_mode != state["mode"]
+            symbol_changed = asset_symbol != state["entry_symbol"]
+            leverage_changed = abs(target_leverage - state["current_leverage"]) > 0.1
+            should_close = pf == 0.0 or mode_changed or symbol_changed
+            
+            # Close existing position if needed
+            if state["position_open"] and should_close:
+                # Realize PnL
+                bar_pnl = unrealized_pnl
+                day_realized_pnl += bar_pnl
+                state["position_open"] = False
+                unrealized_pnl = 0.0
+            
+            # Open new position or adjust size
+            if pf > 0 and asset_symbol and state["trading"]:
+                if not state["position_open"] or leverage_changed:
+                    # Close old position if resizing
+                    if state["position_open"]:
+                        bar_pnl = unrealized_pnl
+                        day_realized_pnl += bar_pnl
+                        unrealized_pnl = 0.0
+                    
+                    # Open new position at current prices
+                    current_capital = day_start_capital + day_realized_pnl
+                    state["entry_price"] = bar[f"{asset_symbol}_close"]
+                    state["entry_symbol"] = asset_symbol
+                    state["entry_size"] = current_capital * target_leverage
+                    state["current_leverage"] = target_leverage
+                    state["position_open"] = True
+            
+            # Store bar result
+            bar_results.append({
+                'timestamp': bar['date'],
+                'day': day,
+                'mode': state['mode'],
+                'position_fraction': pf,
+                'leverage': target_leverage,
+                'asset_symbol': asset_symbol,
+                'asset_intraday_ret': asset_ret,
+                'position_open': state['position_open'],
+                'entry_price': state['entry_price'] if state['position_open'] else 0,
+                'current_price': bar[f"{asset_symbol}_close"] if asset_symbol else 0,
+                'position_size': state['entry_size'] if state['position_open'] else 0,
+                'bar_realized_pnl': bar_pnl,
+                'unrealized_pnl': unrealized_pnl,
+                'day_realized_pnl': day_realized_pnl,
+                'day_total_pnl': day_realized_pnl + unrealized_pnl,
+                'vix': VIX
+            })
         
-        # Leverage based on VIX
-        leverage = 0.0
-        if mode == "LONG":
-            base = 4.0 if VIX < 12 else 3.0 if VIX < 15 else 2.0
-            leverage = base * pf
+        # End of day: close any open positions
+        if state["position_open"]:
+            last_bar = day_data.iloc[-1]
+            exit_price = last_bar[f"{state['entry_symbol']}_close"]
+            if state["mode"] == "LONG":
+                final_pnl = state["entry_size"] * (exit_price - state["entry_price"]) / state["entry_price"]
+            else:
+                final_pnl = state["entry_size"] * (state["entry_price"] - exit_price) / state["entry_price"]
+            day_realized_pnl += final_pnl
         
-        if mode == "SHORT":
-            base = 2.0 if VIX < 20 else 4.0 if VIX < 25 else 5.0
-            leverage = base * pf
+        # Update capital
+        end_day_capital = day_start_capital + day_realized_pnl
+        daily_return = day_realized_pnl / day_start_capital
         
-        rows.append({
-            "date": r["date"],
-            "mode": mode,
-            "position_fraction": pf,
-            "leverage": leverage,
-            "asset_ret": asset_ret,
-            "smh_ret": SMH_RET,
-            "soxx_ret": SOXX_RET,
-            "qqq_ret": QQQ_RET,
-            "vix": VIX
+        daily_results.append({
+            'date': day,
+            'start_capital': day_start_capital,
+            'pnl_dollars': day_realized_pnl,
+            'pnl_pct': daily_return,
+            'end_capital': end_day_capital
         })
+        
+        capital = end_day_capital
     
-    return pd.DataFrame(rows)
+    return pd.DataFrame(bar_results), pd.DataFrame(daily_results), capital
 
 
-def analyze_results(results):
-    """Deep dive analysis of backtest results"""
+def analyze_backtest(bar_df, daily_df, final_capital, initial_capital=100000):
+    """Comprehensive analysis"""
     
-    # Calculate strategy returns
-    results['strategy_ret'] = results['asset_ret'] * results['position_fraction'] * results['leverage']
-    results['cumulative_ret'] = (1 + results['strategy_ret']).cumprod()
+    print("\n" + "="*70)
+    print("CORRECTED BACKTEST RESULTS")
+    print("="*70)
     
-    print("\n" + "="*60)
-    print("DETAILED ANALYSIS")
-    print("="*60)
+    print(f"\nInitial Capital: ${initial_capital:,.2f}")
+    print(f"Final Capital: ${final_capital:,.2f}")
+    total_return = (final_capital / initial_capital - 1) * 100
+    print(f"Total Return: {total_return:+.2f}%")
     
-    # By mode analysis
-    print("\n=== Performance by Mode ===")
-    for mode in ['LONG', 'SHORT', 'NEUTRAL']:
-        mode_data = results[results['mode'] == mode]
-        if len(mode_data) > 0:
-            avg_ret = mode_data['strategy_ret'].mean() * 100
-            total_ret = ((1 + mode_data['strategy_ret']).prod() - 1) * 100
-            win_rate = len(mode_data[mode_data['strategy_ret'] > 0]) / len(mode_data) * 100
-            print(f"\n  {mode}:")
-            print(f"    Days: {len(mode_data)}")
-            print(f"    Avg Daily: {avg_ret:.3f}%")
-            print(f"    Total: {total_ret:.2f}%")
-            print(f"    Win Rate: {win_rate:.2f}%")
-            print(f"    Avg Leverage: {mode_data['leverage'].mean():.2f}x")
+    print(f"\nPeriod: {daily_df['date'].min()} to {daily_df['date'].max()}")
+    print(f"Trading Days: {len(daily_df)}")
     
-    # Leverage analysis
-    print("\n=== Performance by Leverage Level ===")
-    for lev in sorted(results['leverage'].unique()):
-        if lev > 0:
-            lev_data = results[results['leverage'] == lev]
-            avg_ret = lev_data['strategy_ret'].mean() * 100
-            win_rate = len(lev_data[lev_data['strategy_ret'] > 0]) / len(lev_data) * 100
-            print(f"  {lev:.1f}x: {len(lev_data)} days, avg={avg_ret:.3f}%, win rate={win_rate:.2f}%")
+    print(f"\n{'='*70}")
+    print("DAILY PERFORMANCE")
+    print(f"{'='*70}")
     
-    # VIX regime analysis
-    print("\n=== Performance by VIX Regime ===")
-    bins = [0, 15, 20, 25, 100]
-    labels = ['<15 (low)', '15-20', '20-25', '>25 (high)']
-    results['vix_regime'] = pd.cut(results['vix'], bins=bins, labels=labels)
+    winning_days = daily_df[daily_df['pnl_pct'] > 0]
+    losing_days = daily_df[daily_df['pnl_pct'] < 0]
+    flat_days = daily_df[daily_df['pnl_pct'] == 0]
     
-    for regime in labels:
-        regime_data = results[results['vix_regime'] == regime]
-        if len(regime_data) > 0:
-            avg_ret = regime_data['strategy_ret'].mean() * 100
-            win_rate = len(regime_data[regime_data['strategy_ret'] > 0]) / len(regime_data) * 100
-            print(f"  {regime}: {len(regime_data)} days, avg={avg_ret:.3f}%, win rate={win_rate:.2f}%")
+    print(f"Winning Days: {len(winning_days)} ({len(winning_days)/len(daily_df)*100:.1f}%)")
+    print(f"Losing Days: {len(losing_days)} ({len(losing_days)/len(daily_df)*100:.1f}%)")
+    print(f"Flat Days: {len(flat_days)} ({len(flat_days)/len(daily_df)*100:.1f}%)")
     
-    # Worst days
-    print("\n=== Top 10 Worst Days ===")
-    worst = results.nsmallest(10, 'strategy_ret')[['date', 'mode', 'leverage', 'asset_ret', 'strategy_ret', 'vix']]
-    worst['date'] = worst['date'].dt.date
-    worst['asset_ret'] = worst['asset_ret'] * 100
-    worst['strategy_ret'] = worst['strategy_ret'] * 100
-    print(worst.to_string(index=False))
+    print(f"\nAvg Daily Return: {daily_df['pnl_pct'].mean()*100:+.3f}%")
+    print(f"Daily Std Dev: {daily_df['pnl_pct'].std()*100:.3f}%")
+    print(f"Best Day: {daily_df['pnl_pct'].max()*100:+.2f}%")
+    print(f"Worst Day: {daily_df['pnl_pct'].min()*100:+.2f}%")
     
-    # Best days
-    print("\n=== Top 10 Best Days ===")
-    best = results.nlargest(10, 'strategy_ret')[['date', 'mode', 'leverage', 'asset_ret', 'strategy_ret', 'vix']]
-    best['date'] = best['date'].dt.date
-    best['asset_ret'] = best['asset_ret'] * 100
-    best['strategy_ret'] = best['strategy_ret'] * 100
-    print(best.to_string(index=False))
+    if daily_df['pnl_pct'].std() > 0:
+        sharpe = (daily_df['pnl_pct'].mean() / daily_df['pnl_pct'].std()) * np.sqrt(252)
+        print(f"\nSharpe Ratio: {sharpe:.2f}")
     
-    # Monthly analysis
-    print("\n=== Monthly Performance ===")
-    results['year_month'] = results['date'].dt.to_period('M')
-    monthly = results.groupby('year_month').agg({
-        'strategy_ret': lambda x: ((1 + x).prod() - 1) * 100,
-        'date': 'count'
-    }).rename(columns={'strategy_ret': 'return_%', 'date': 'days'})
-    print(monthly.tail(12).to_string())
+    # Drawdown
+    daily_df['cumulative'] = (1 + daily_df['pnl_pct']).cumprod()
+    daily_df['peak'] = daily_df['cumulative'].cummax()
+    daily_df['drawdown'] = (daily_df['cumulative'] - daily_df['peak']) / daily_df['peak']
+    max_dd = daily_df['drawdown'].min()
+    print(f"Max Drawdown: {max_dd*100:.2f}%")
     
-    return results
+    # CAGR
+    days = len(daily_df)
+    years = days / 252
+    if years > 0:
+        cagr = (pow(final_capital / initial_capital, 1/years) - 1) * 100
+        print(f"CAGR (annualized): {cagr:+.2f}%")
+    
+    print(f"\n{'='*70}")
+    print("FIRST DAY SAMPLE (Manual Verification)")
+    print(f"{'='*70}")
+    first_day = bar_df.head(15)[['timestamp', 'mode', 'position_fraction', 'leverage', 
+                                  'position_open', 'bar_realized_pnl', 'unrealized_pnl', 
+                                  'day_realized_pnl', 'day_total_pnl']]
+    print(first_day.to_string(index=False))
+    
+    return daily_df
 
 
 if __name__ == "__main__":
-    print("="*60)
-    print("ENHANCED BACKTEST ANALYSIS")
-    print("="*60)
+    print("="*70)
+    print("CORRECTED BACKTEST - PROPER POSITION TRACKING")
+    print("="*70)
     
-    start_date = datetime(2022, 1, 1)
-    end_date = datetime.now()
-    
-    print(f"\nPeriod: {start_date.date()} to {end_date.date()}")
-    print("="*60)
-    print()
-    
-    # Fetch data
-    smh = fetch_daily_data("SMH", start_date, end_date)
-    soxx = fetch_daily_data("SOXX", start_date, end_date)
-    qqq = fetch_daily_data("QQQ", start_date, end_date)
-    vix = fetch_daily_data("^VIX", start_date, end_date)
-    
-    if any(df is None for df in [smh, soxx, qqq, vix]):
-        print("\n❌ Failed to fetch data")
-        exit(1)
-    
-    # Compute returns
-    print("\nComputing returns...")
-    smh = compute_daily_ret(smh)
-    soxx = compute_daily_ret(soxx)
-    qqq = compute_daily_ret(qqq)
-    
-    # Rename VIX close column before merging
-    vix = vix.rename(columns={'close': 'VIX_close'})
-    
-    # Merge
-    print("Merging datasets...")
-    data = smh.merge(soxx, on="date", suffixes=("_SMH", "_SOXX"))
-    data = data.merge(qqq, on="date", suffixes=("", "_QQQ"))
-    data = data.merge(vix[['date', 'VIX_close']], on="date")
-    
-    data = data.rename(columns={
-        "RET_SMH": "SMH_RET",
-        "RET_SOXX": "SOXX_RET",
-        "RET": "QQQ_RET"
-    })
-    
-    print(f"✓ {len(data)} trading days\n")
-    
-    # Run backtest
-    print("Running backtest...")
-    results = run_backtest(data)
-    
-    # Analyze results
-    results = analyze_results(results)
-    
-    # Save results
-    results.to_csv("backtest_detailed.csv", index=False)
-    print(f"\n✓ Saved to backtest_detailed.csv")
+    try:
+        # Fetch data
+        print("\nFetching data...")
+        smh = fetch_yfinance_intraday("SMH", lookback_days=60)
+        soxx = fetch_yfinance_intraday("SOXX", lookback_days=60)
+        qqq = fetch_yfinance_intraday("QQQ", lookback_days=60)
+        
+        vix_ticker = yf.Ticker("^VIX")
+        vix_df = vix_ticker.history(period="60d", interval="1d")
+        vix_df = vix_df.reset_index()
+        
+        if vix_df['Date'].dt.tz is None:
+            vix_df['date'] = pd.to_datetime(vix_df['Date']).dt.tz_localize(TIMEZONE)
+        else:
+            vix_df['date'] = pd.to_datetime(vix_df['Date']).dt.tz_convert(TIMEZONE)
+        
+        vix_df = vix_df[['date', 'Close']].rename(columns={'Close': 'VIX_close'})
+        
+        if any(df is None for df in [smh, soxx, qqq]):
+            print("\n❌ Failed to fetch data")
+            exit(1)
+        
+        # Compute returns
+        print("\nComputing returns...")
+        smh = compute_intraday_ret(smh)
+        soxx = compute_intraday_ret(soxx)
+        qqq = compute_intraday_ret(qqq)
+        
+        # Merge
+        data = smh.merge(soxx, on="date", suffixes=("_SMH", "_SOXX"), how='inner')
+        data = data.merge(qqq, on="date", how='inner', suffixes=("", "_QQQ"))
+        
+        data = data.rename(columns={
+            "open_SMH": "SMH_open", "close_SMH": "SMH_close",
+            "open_SOXX": "SOXX_open", "close_SOXX": "SOXX_close",
+            "open": "QQQ_open", "close": "QQQ_close",
+            "RET_SMH": "SMH_RET", "RET_SOXX": "SOXX_RET", "RET": "QQQ_RET"
+        })
+        
+        data["LONG_PERSISTENCE_MIN"] = data["LONG_PERSISTENCE_MIN_SMH"]
+        data["SHORT_PERSISTENCE_MIN"] = data["SHORT_PERSISTENCE_MIN_SMH"]
+        
+        data['merge_date'] = data['date'].dt.date
+        vix_df['merge_date'] = vix_df['date'].dt.date
+        data = data.merge(vix_df[['merge_date', 'VIX_close']], on='merge_date', how='left')
+        data['VIX_close'] = data['VIX_close'].ffill()
+        data = data.drop('merge_date', axis=1)
+        
+        print(f"✓ {len(data)} bars ready\n")
+        
+        # Run corrected backtest
+        print("Running CORRECTED backtest...")
+        bar_results, daily_results, final_capital = run_backtest_correct(data, initial_capital=100000)
+        
+        # Analyze
+        daily_results = analyze_backtest(bar_results, daily_results, final_capital)
+        
+        # Save
+        bar_results.to_csv("backtest_corrected_bars.csv", index=False)
+        daily_results.to_csv("backtest_corrected_daily.csv", index=False)
+        
+        print(f"\n{'='*70}")
+        print("✓ Files saved: backtest_corrected_bars.csv & backtest_corrected_daily.csv")
+        print(f"{'='*70}")
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
