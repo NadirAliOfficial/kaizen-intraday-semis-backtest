@@ -66,14 +66,16 @@ def compute_intraday_ret(df):
     return df
 
 
-def run_backtest_correct(data, initial_capital=100000):
+def run_backtest_strict(data, initial_capital=100000):
     """
-    CORRECTED backtest with proper position tracking
+    STRICT IMPLEMENTATION - NO COMPROMISES
     
-    KEY FIX:
-    - Track entry price when opening position
-    - Calculate PnL based on current price vs entry price
-    - Only realize PnL when position changes or closes
+    Rules:
+    1. One entry per signal, one exit when conditions change
+    2. PnL calculated ONLY from entry price to exit price
+    3. NO intrabar rebalancing
+    4. SHORT rules are MORE defensive than LONG (no anti-churn)
+    5. Kill switch is HARD STOP (no more trading that day)
     """
     
     capital = initial_capital
@@ -83,220 +85,255 @@ def run_backtest_correct(data, initial_capital=100000):
     # Group by day
     for day, day_data in data.groupby(data['date'].dt.date):
         day_start_capital = capital
-        day_realized_pnl = 0.0
+        day_pnl = 0.0
         
-        # State for this day
+        # State
         state = {
-            "mode": "NEUTRAL",
-            "pf": 0.0,
-            "trading": True,
+            "trading_enabled": True,
             "position_open": False,
             "entry_price": 0.0,
             "entry_symbol": None,
+            "entry_mode": None,
             "entry_size": 0.0,
-            "current_leverage": 0.0
+            "entry_leverage": 0.0
         }
+        
+        prev_bar = None
         
         # Process each bar
         for idx, bar in day_data.iterrows():
-            SMH_RET = bar["SMH_RET"]
-            SOXX_RET = bar["SOXX_RET"]
-            QQQ_RET = bar["QQQ_RET"]
-            VIX = bar["VIX_close"]
-            LONG_PERSIST = bar["LONG_PERSISTENCE_MIN"]
-            SHORT_PERSIST = bar["SHORT_PERSISTENCE_MIN"]
             
-            # Kill switch
-            if day_realized_pnl / day_start_capital <= DAILY_KILL:
-                # Close position if open
+            # Skip first bar (need previous bar for decisions)
+            if prev_bar is None:
+                prev_bar = bar
+                bar_results.append({
+                    'timestamp': bar['date'],
+                    'day': day,
+                    'signal': 'WAIT',
+                    'position_open': False,
+                    'bar_pnl': 0,
+                    'day_pnl': 0,
+                    'capital': capital
+                })
+                continue
+            
+            # Check kill switch FIRST
+            if day_pnl / day_start_capital <= DAILY_KILL:
+                # HARD STOP - close position and disable trading
                 if state["position_open"]:
-                    exit_price = bar[f"{state['entry_symbol']}_close"]
-                    if state["mode"] == "LONG":
+                    exit_price = bar[f"{state['entry_symbol']}_open"]
+                    if state["entry_mode"] == "LONG":
                         pnl = state["entry_size"] * (exit_price - state["entry_price"]) / state["entry_price"]
-                    else:  # SHORT
+                    else:
                         pnl = state["entry_size"] * (state["entry_price"] - exit_price) / state["entry_price"]
-                    day_realized_pnl += pnl
+                    day_pnl += pnl
                     state["position_open"] = False
                 
-                state["trading"] = False
-                state["pf"] = 0.0
-            
-            # Detect mode
-            prev_mode = state["mode"]
-            if state["trading"]:
-                if SMH_RET > 0 and SOXX_RET > 0:
-                    state["mode"] = "LONG"
-                elif SMH_RET < 0 and SOXX_RET < 0:
-                    state["mode"] = "SHORT"
-                else:
-                    state["mode"] = "NEUTRAL"
+                state["trading_enabled"] = False
                 
-                if state["mode"] == "NEUTRAL":
-                    state["pf"] = 0.0
+                bar_results.append({
+                    'timestamp': bar['date'],
+                    'day': day,
+                    'signal': 'KILL_SWITCH',
+                    'position_open': False,
+                    'bar_pnl': pnl if state["position_open"] else 0,
+                    'day_pnl': day_pnl,
+                    'capital': day_start_capital + day_pnl
+                })
+                continue
             
-            # Select asset
-            if state["mode"] == "LONG":
+            if not state["trading_enabled"]:
+                bar_results.append({
+                    'timestamp': bar['date'],
+                    'day': day,
+                    'signal': 'DISABLED',
+                    'position_open': False,
+                    'bar_pnl': 0,
+                    'day_pnl': day_pnl,
+                    'capital': day_start_capital + day_pnl
+                })
+                continue
+            
+            # Use PREVIOUS bar for signal generation
+            SMH_RET = prev_bar["SMH_RET"]
+            SOXX_RET = prev_bar["SOXX_RET"]
+            QQQ_RET = prev_bar["QQQ_RET"]
+            VIX = prev_bar["VIX_close"]
+            LONG_PERSIST = prev_bar["LONG_PERSISTENCE_MIN"]
+            SHORT_PERSIST = prev_bar["SHORT_PERSISTENCE_MIN"]
+            
+            # Detect signal
+            if SMH_RET > 0 and SOXX_RET > 0:
+                signal_mode = "LONG"
                 asset_ret = max(SMH_RET, SOXX_RET)
                 asset_symbol = "SMH" if SMH_RET >= SOXX_RET else "SOXX"
-            elif state["mode"] == "SHORT":
+            elif SMH_RET < 0 and SOXX_RET < 0:
+                signal_mode = "SHORT"
                 asset_ret = min(SMH_RET, SOXX_RET)
                 asset_symbol = "SMH" if SMH_RET <= SOXX_RET else "SOXX"
             else:
+                signal_mode = "NEUTRAL"
                 asset_ret = 0.0
                 asset_symbol = None
             
-            pf = state["pf"]
-            
-            # Progressive entry
-            if state["mode"] == "LONG":
+            # Calculate position fraction
+            pf = 0.0
+            if signal_mode == "LONG":
                 if asset_ret >= ENTRY_3:
                     pf = 1.0
                 elif asset_ret >= ENTRY_2:
-                    pf = max(pf, 0.7)
+                    pf = 0.7
                 elif asset_ret >= ENTRY_1:
+                    pf = 0.5
+                
+                # Anti-churn for LONG only
+                if 0.003 <= QQQ_RET <= 0.007 and LONG_PERSIST >= 30:
                     pf = max(pf, 0.5)
+                
+                # Invalidation
+                if asset_ret <= INVALID_ZERO:
+                    pf = 0.0  # Immediate exit
+                if asset_ret <= -HARD_EXIT:
+                    pf = 0.0
             
-            if state["mode"] == "SHORT":
+            elif signal_mode == "SHORT":
                 if asset_ret <= -ENTRY_3:
                     pf = 1.0
                 elif asset_ret <= -ENTRY_2:
-                    pf = max(pf, 0.7)
+                    pf = 0.7
                 elif asset_ret <= -ENTRY_1:
-                    pf = max(pf, 0.5)
+                    pf = 0.5
+                
+                # NO anti-churn for SHORT - more defensive
+                
+                # Immediate invalidation for SHORT
+                if asset_ret >= INVALID_ZERO:
+                    pf = 0.0  # Immediate exit
+                if asset_ret >= HARD_EXIT:
+                    pf = 0.0
             
-            # Anti-churn
-            if state["mode"] == "LONG" and 0.003 <= QQQ_RET <= 0.007 and LONG_PERSIST >= 30:
-                pf = max(pf, 0.5)
-            if state["mode"] == "SHORT" and -0.007 <= QQQ_RET <= -0.003 and SHORT_PERSIST >= 30:
-                pf = max(pf, 0.5)
-            
-            # Invalidation
-            if state["mode"] == "LONG" and asset_ret <= INVALID_ZERO:
-                pf = max(pf * 0.5, 0.0)
-            if state["mode"] == "SHORT" and asset_ret >= INVALID_ZERO:
-                pf = max(pf * 0.5, 0.0)
-            
-            if state["mode"] == "LONG" and asset_ret <= -HARD_EXIT:
-                pf = 0.0
-            if state["mode"] == "SHORT" and asset_ret >= HARD_EXIT:
-                pf = 0.0
-            
-            # Leverage (CONSERVATIVE)
-            base_leverage = 0.0
-            if state["mode"] == "LONG":
+            # Calculate leverage
+            if signal_mode == "LONG" and pf > 0:
                 if VIX < 12:
-                    base_leverage = 2.0
+                    base_lev = 4.0
                 elif VIX < 15:
-                    base_leverage = 1.5
+                    base_lev = 3.0
+                elif VIX < 20:
+                    base_lev = 2.0
                 else:
-                    base_leverage = 1.0
-            
-            if state["mode"] == "SHORT":
+                    base_lev = 2.0
+                leverage = base_lev * pf
+            elif signal_mode == "SHORT" and pf > 0:
                 if VIX < 20:
-                    base_leverage = 1.0
+                    base_lev = 2.0
                 elif VIX < 25:
-                    base_leverage = 1.5
+                    base_lev = 4.0
                 else:
-                    base_leverage = 2.0
+                    base_lev = 5.0
+                leverage = base_lev * pf
+            else:
+                leverage = 0.0
             
-            target_leverage = base_leverage * pf
-            state["pf"] = pf
-            
-            # CRITICAL: Position Management Logic
+            # Position management
             bar_pnl = 0.0
-            unrealized_pnl = 0.0
+            signal_action = "HOLD"
+            
+            # Check if we need to exit current position
+            should_exit = False
+            if state["position_open"]:
+                # Exit if signal changed
+                if signal_mode != state["entry_mode"]:
+                    should_exit = True
+                # Exit if asset switched
+                elif asset_symbol != state["entry_symbol"]:
+                    should_exit = True
+                # Exit if position fraction went to zero
+                elif pf == 0.0:
+                    should_exit = True
+                # Exit if leverage changed significantly
+                elif abs(leverage - state["entry_leverage"]) > 0.5:
+                    should_exit = True
+            
+            # Execute exit
+            if state["position_open"] and should_exit:
+                exit_price = bar[f"{state['entry_symbol']}_open"]
+                if state["entry_mode"] == "LONG":
+                    bar_pnl = state["entry_size"] * (exit_price - state["entry_price"]) / state["entry_price"]
+                else:
+                    bar_pnl = state["entry_size"] * (state["entry_price"] - exit_price) / state["entry_price"]
+                
+                day_pnl += bar_pnl
+                state["position_open"] = False
+                signal_action = "EXIT"
+            
+            # Execute entry (only if not already in position)
+            if not state["position_open"] and pf > 0 and signal_mode != "NEUTRAL":
+                current_capital = day_start_capital + day_pnl
+                state["entry_price"] = bar[f"{asset_symbol}_open"]
+                state["entry_symbol"] = asset_symbol
+                state["entry_mode"] = signal_mode
+                state["entry_size"] = current_capital * leverage
+                state["entry_leverage"] = leverage
+                state["position_open"] = True
+                signal_action = "ENTRY"
             
             # Calculate unrealized PnL if position is open
+            unrealized = 0.0
             if state["position_open"]:
                 current_price = bar[f"{state['entry_symbol']}_close"]
-                if state["mode"] == "LONG":
-                    unrealized_pnl = state["entry_size"] * (current_price - state["entry_price"]) / state["entry_price"]
-                else:  # SHORT
-                    unrealized_pnl = state["entry_size"] * (state["entry_price"] - current_price) / state["entry_price"]
+                if state["entry_mode"] == "LONG":
+                    unrealized = state["entry_size"] * (current_price - state["entry_price"]) / state["entry_price"]
+                else:
+                    unrealized = state["entry_size"] * (state["entry_price"] - current_price) / state["entry_price"]
             
-            # Check if we need to close or adjust position
-            mode_changed = prev_mode != state["mode"]
-            symbol_changed = asset_symbol != state["entry_symbol"]
-            leverage_changed = abs(target_leverage - state["current_leverage"]) > 0.1
-            should_close = pf == 0.0 or mode_changed or symbol_changed
-            
-            # Close existing position if needed
-            if state["position_open"] and should_close:
-                # Realize PnL
-                bar_pnl = unrealized_pnl
-                day_realized_pnl += bar_pnl
-                state["position_open"] = False
-                unrealized_pnl = 0.0
-            
-            # Open new position or adjust size
-            if pf > 0 and asset_symbol and state["trading"]:
-                if not state["position_open"] or leverage_changed:
-                    # Close old position if resizing
-                    if state["position_open"]:
-                        bar_pnl = unrealized_pnl
-                        day_realized_pnl += bar_pnl
-                        unrealized_pnl = 0.0
-                    
-                    # Open new position at current prices
-                    current_capital = day_start_capital + day_realized_pnl
-                    state["entry_price"] = bar[f"{asset_symbol}_close"]
-                    state["entry_symbol"] = asset_symbol
-                    state["entry_size"] = current_capital * target_leverage
-                    state["current_leverage"] = target_leverage
-                    state["position_open"] = True
-            
-            # Store bar result
             bar_results.append({
                 'timestamp': bar['date'],
                 'day': day,
-                'mode': state['mode'],
+                'signal': signal_action,
+                'mode': signal_mode,
+                'position_open': state["position_open"],
                 'position_fraction': pf,
-                'leverage': target_leverage,
-                'asset_symbol': asset_symbol,
-                'asset_intraday_ret': asset_ret,
-                'position_open': state['position_open'],
-                'entry_price': state['entry_price'] if state['position_open'] else 0,
+                'leverage': leverage,
+                'entry_price': state["entry_price"] if state["position_open"] else 0,
                 'current_price': bar[f"{asset_symbol}_close"] if asset_symbol else 0,
-                'position_size': state['entry_size'] if state['position_open'] else 0,
-                'bar_realized_pnl': bar_pnl,
-                'unrealized_pnl': unrealized_pnl,
-                'day_realized_pnl': day_realized_pnl,
-                'day_total_pnl': day_realized_pnl + unrealized_pnl,
-                'vix': VIX
+                'bar_pnl': bar_pnl,
+                'unrealized_pnl': unrealized,
+                'day_pnl': day_pnl,
+                'day_total': day_pnl + unrealized,
+                'capital': day_start_capital + day_pnl
             })
+            
+            prev_bar = bar
         
-        # End of day: close any open positions
+        # End of day - force close any open position
         if state["position_open"]:
             last_bar = day_data.iloc[-1]
             exit_price = last_bar[f"{state['entry_symbol']}_close"]
-            if state["mode"] == "LONG":
+            if state["entry_mode"] == "LONG":
                 final_pnl = state["entry_size"] * (exit_price - state["entry_price"]) / state["entry_price"]
             else:
                 final_pnl = state["entry_size"] * (state["entry_price"] - exit_price) / state["entry_price"]
-            day_realized_pnl += final_pnl
+            day_pnl += final_pnl
         
         # Update capital
-        end_day_capital = day_start_capital + day_realized_pnl
-        daily_return = day_realized_pnl / day_start_capital
+        capital = day_start_capital + day_pnl
         
         daily_results.append({
             'date': day,
             'start_capital': day_start_capital,
-            'pnl_dollars': day_realized_pnl,
-            'pnl_pct': daily_return,
-            'end_capital': end_day_capital
+            'day_pnl_dollars': day_pnl,
+            'day_pnl_pct': day_pnl / day_start_capital,
+            'end_capital': capital
         })
-        
-        capital = end_day_capital
     
     return pd.DataFrame(bar_results), pd.DataFrame(daily_results), capital
 
 
 def analyze_backtest(bar_df, daily_df, final_capital, initial_capital=100000):
-    """Comprehensive analysis"""
+    """Analyze results"""
     
     print("\n" + "="*70)
-    print("CORRECTED BACKTEST RESULTS")
+    print("STRICT IMPLEMENTATION RESULTS")
     print("="*70)
     
     print(f"\nInitial Capital: ${initial_capital:,.2f}")
@@ -311,25 +348,30 @@ def analyze_backtest(bar_df, daily_df, final_capital, initial_capital=100000):
     print("DAILY PERFORMANCE")
     print(f"{'='*70}")
     
-    winning_days = daily_df[daily_df['pnl_pct'] > 0]
-    losing_days = daily_df[daily_df['pnl_pct'] < 0]
-    flat_days = daily_df[daily_df['pnl_pct'] == 0]
+    winning_days = daily_df[daily_df['day_pnl_pct'] > 0]
+    losing_days = daily_df[daily_df['day_pnl_pct'] < 0]
+    flat_days = daily_df[daily_df['day_pnl_pct'] == 0]
     
     print(f"Winning Days: {len(winning_days)} ({len(winning_days)/len(daily_df)*100:.1f}%)")
     print(f"Losing Days: {len(losing_days)} ({len(losing_days)/len(daily_df)*100:.1f}%)")
     print(f"Flat Days: {len(flat_days)} ({len(flat_days)/len(daily_df)*100:.1f}%)")
     
-    print(f"\nAvg Daily Return: {daily_df['pnl_pct'].mean()*100:+.3f}%")
-    print(f"Daily Std Dev: {daily_df['pnl_pct'].std()*100:.3f}%")
-    print(f"Best Day: {daily_df['pnl_pct'].max()*100:+.2f}%")
-    print(f"Worst Day: {daily_df['pnl_pct'].min()*100:+.2f}%")
+    if len(winning_days) > 0:
+        print(f"\nAvg Win: {winning_days['day_pnl_pct'].mean()*100:+.3f}%")
+    if len(losing_days) > 0:
+        print(f"Avg Loss: {losing_days['day_pnl_pct'].mean()*100:+.3f}%")
     
-    if daily_df['pnl_pct'].std() > 0:
-        sharpe = (daily_df['pnl_pct'].mean() / daily_df['pnl_pct'].std()) * np.sqrt(252)
+    print(f"\nAvg Daily Return: {daily_df['day_pnl_pct'].mean()*100:+.3f}%")
+    print(f"Daily Std Dev: {daily_df['day_pnl_pct'].std()*100:.3f}%")
+    print(f"Best Day: {daily_df['day_pnl_pct'].max()*100:+.2f}%")
+    print(f"Worst Day: {daily_df['day_pnl_pct'].min()*100:+.2f}%")
+    
+    if daily_df['day_pnl_pct'].std() > 0:
+        sharpe = (daily_df['day_pnl_pct'].mean() / daily_df['day_pnl_pct'].std()) * np.sqrt(252)
         print(f"\nSharpe Ratio: {sharpe:.2f}")
     
     # Drawdown
-    daily_df['cumulative'] = (1 + daily_df['pnl_pct']).cumprod()
+    daily_df['cumulative'] = (1 + daily_df['day_pnl_pct']).cumprod()
     daily_df['peak'] = daily_df['cumulative'].cummax()
     daily_df['drawdown'] = (daily_df['cumulative'] - daily_df['peak']) / daily_df['peak']
     max_dd = daily_df['drawdown'].min()
@@ -342,20 +384,37 @@ def analyze_backtest(bar_df, daily_df, final_capital, initial_capital=100000):
         cagr = (pow(final_capital / initial_capital, 1/years) - 1) * 100
         print(f"CAGR (annualized): {cagr:+.2f}%")
     
+    # Signal analysis
     print(f"\n{'='*70}")
-    print("FIRST DAY SAMPLE (Manual Verification)")
+    print("SIGNAL ANALYSIS")
     print(f"{'='*70}")
-    first_day = bar_df.head(15)[['timestamp', 'mode', 'position_fraction', 'leverage', 
-                                  'position_open', 'bar_realized_pnl', 'unrealized_pnl', 
-                                  'day_realized_pnl', 'day_total_pnl']]
-    print(first_day.to_string(index=False))
+    entries = bar_df[bar_df['signal'] == 'ENTRY']
+    exits = bar_df[bar_df['signal'] == 'EXIT']
+    print(f"Total Entries: {len(entries)}")
+    print(f"Total Exits: {len(exits)}")
+    
+    kill_switches = len(bar_df[bar_df['signal'] == 'KILL_SWITCH'])
+    print(f"Kill Switch Triggers: {kill_switches}")
+    
+    print(f"\n{'='*70}")
+    print("SAMPLE - First Day Trades")
+    print(f"{'='*70}")
+    first_day = bar_df[bar_df['signal'].isin(['ENTRY', 'EXIT', 'KILL_SWITCH'])].head(10)
+    if len(first_day) > 0:
+        print(first_day[['timestamp', 'signal', 'mode', 'leverage', 'bar_pnl', 'day_pnl']].to_string(index=False))
     
     return daily_df
 
 
 if __name__ == "__main__":
     print("="*70)
-    print("CORRECTED BACKTEST - PROPER POSITION TRACKING")
+    print("STRICT BACKTEST - CONSERVATIVE IMPLEMENTATION")
+    print("="*70)
+    print("\nRules:")
+    print("• Single entry → single exit (no intrabar rebalancing)")
+    print("• SHORT more defensive than LONG (no anti-churn)")
+    print("• Kill switch is HARD STOP")
+    print("• PnL only from entry to exit price")
     print("="*70)
     
     try:
@@ -408,19 +467,19 @@ if __name__ == "__main__":
         
         print(f"✓ {len(data)} bars ready\n")
         
-        # Run corrected backtest
-        print("Running CORRECTED backtest...")
-        bar_results, daily_results, final_capital = run_backtest_correct(data, initial_capital=100000)
+        # Run strict backtest
+        print("Running STRICT backtest...")
+        bar_results, daily_results, final_capital = run_backtest_strict(data, initial_capital=100000)
         
         # Analyze
         daily_results = analyze_backtest(bar_results, daily_results, final_capital)
         
         # Save
-        bar_results.to_csv("backtest_corrected_bars.csv", index=False)
-        daily_results.to_csv("backtest_corrected_daily.csv", index=False)
+        bar_results.to_csv("backtest_strict_bars.csv", index=False)
+        daily_results.to_csv("backtest_strict_daily.csv", index=False)
         
         print(f"\n{'='*70}")
-        print("✓ Files saved: backtest_corrected_bars.csv & backtest_corrected_daily.csv")
+        print("✓ Files saved: backtest_strict_bars.csv & backtest_strict_daily.csv")
         print(f"{'='*70}")
         
     except Exception as e:
