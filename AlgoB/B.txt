@@ -1,0 +1,39 @@
+meta:
+  status: "SEALED"
+  version: "PIÑON_FIJO_DYNAMIC"
+
+universe:
+  long: SMH
+  short: SOXL
+  benchmark: QQQ
+
+indicators:
+  VIX: "VIX_CLOSE"
+  VIX_CHG: "(VIX_CLOSE - VIX_PREV_CLOSE) / VIX_PREV_CLOSE"
+  PREV_CLOSE: "SMH_PREV_CLOSE"
+
+risk:
+  daily_sl:
+    ref: "PREV_CLOSE"
+    max_dd: -0.02
+    action: "FLATTEN"
+
+long:
+  asset: SMH
+  leverage: >
+    3.5 if VIX < 13
+    else 3.25 if VIX < 15
+    else 3.0
+  entry: "OPEN"
+  reentry: "CLOSE_MINUS_5M"
+
+short:
+  if: "VIX_CHG >= 0.02 and SMH_RET <= -0.005"
+  asset: SOXL
+  direction: SHORT
+  leverage: "1.5 if VIX >= 22 else 1.0"
+  entry: "INTRADAY"
+  exit: "CLOSE_MINUS_5M"
+
+post_short:
+  action: "ENTER_LONG_AT_CLOSE"

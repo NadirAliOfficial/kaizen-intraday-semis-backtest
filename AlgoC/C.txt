@@ -1,0 +1,44 @@
+meta:
+  status: "SEALED"
+  version: "2.3.2 cruce de Ema 25/125
+
+universe:
+  long: SMH
+  short: SOXL
+  benchmark: QQQ
+
+indicators:
+  EMA_FAST: "EMA(SMH_CLOSE,25)"
+  EMA_SLOW: "EMA(SMH_CLOSE,125)"
+  VIX: "VIX_CLOSE"
+  VIX_CHG: "(VIX_CLOSE - VIX_PREV_CLOSE) / VIX_PREV_CLOSE"
+  GAP_UP: "(SMH_OPEN > SMH_PREV_CLOSE)"
+  PREV_CLOSE: "SMH_PREV_CLOSE"
+
+derived:
+  bull: "EMA_FAST > EMA_SLOW"
+
+risk:
+  daily_sl:
+    ref: "PREV_CLOSE"
+    max_dd: -0.02
+    action: "FLATTEN"
+
+long:
+  if: "bull"
+  asset: SMH
+  leverage: >
+    3.5 if VIX < 13
+    else 3.25 if VIX < 15 and GAP_UP
+    else 3.0
+  entry: "OPEN"
+  reentry: "CLOSE_MINUS_5M"
+
+short:
+  if: "VIX_CHG >= 0.02 and SMH_RET <= -0.005"
+  asset: SOXL
+  direction: SHORT
+  leverage: "1.5 if VIX >= 22 else 1.0"
+  entry: "INTRADAY"
+  exit: "CLOSE_MINUS_5M"
+  after_exit: "ENTER_LONG if bull else CASH"
