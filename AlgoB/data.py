@@ -1,9 +1,16 @@
-import pandas as pd
+import yfinance as yf
 
-df = pd.read_csv("AlgoB/market_data_3y.csv", header=[0,1], index_col=0)
-print("Data loaded from AlgoB/market_data_3y.csv")
-def get_data():
-    return df       
+df = yf.download(
+    ["SMH", "SOXL","^VIX"],
+    start="2022-01-01",
+    end="2026-02-01",
+    interval="1d",
+    group_by="ticker"
+)
 
-if __name__ == "__main__":
-    print(df.head())
+# Flatten columns
+df.columns = [f"{col[1]}_{col[0]}" for col in df.columns]
+
+df.to_csv("market_data.csv")
+print(df.head())
+print(df.tail())
