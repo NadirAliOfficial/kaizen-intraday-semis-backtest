@@ -15,7 +15,7 @@ import pytz
 # CONFIGURATION
 # ============================================================================
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7496  # 7497 = LIVE, 7496 = PAPER
+IBKR_PORT = 7497  # 7497 = LIVE, 7496 = PAPER
 CLIENT_ID = 1
 
 SYMBOL = "SMH"
@@ -355,18 +355,18 @@ class ProductionTradingSystem:
                         target_qty = int(target_notional / close)
                         
                         current_notional = self.position_qty * close
-                        deviation = abs(current_notional - target_notional) / target_notional
+                        notional_diff = abs(target_notional - current_notional)
                         
-                        # Rebalance if deviation > 5%
-                        if deviation > 0.05:
+                        # Rebalance if difference > $50
+                        if notional_diff > 50:
                             qty_diff = target_qty - self.position_qty
                             
                             if qty_diff > 0:
-                                log.info(f"📊 Rebalancing UP: +{qty_diff} shares (deviation: {deviation*100:.1f}%)")
+                                log.info(f"📊 Rebalancing UP: +{qty_diff} shares (${notional_diff:,.0f} new capital)")
                                 self.place_moc_order("BUY", qty_diff)
                                 self.position_qty = target_qty
                             elif qty_diff < 0:
-                                log.info(f"📊 Rebalancing DOWN: {qty_diff} shares (deviation: {deviation*100:.1f}%)")
+                                log.info(f"📊 Rebalancing DOWN: {qty_diff} shares (${notional_diff:,.0f} reduction)")
                                 self.place_moc_order("SELL", abs(qty_diff))
                                 self.position_qty = target_qty
                             
@@ -375,7 +375,7 @@ class ProductionTradingSystem:
                             stop_price = close * (1 - STOP_LOSS_PCT - 0.005)
                             self.place_stop_order(self.position_qty, stop_price)
                         else:
-                            log.info(f"✅ Leverage OK (deviation: {deviation*100:.1f}%)")
+                            log.info(f"✅ No rebalancing needed (${notional_diff:.0f} difference)")
             
             # After hours: Reset
             if now > dt_time(17, 0):
