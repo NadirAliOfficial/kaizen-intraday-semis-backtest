@@ -1,6 +1,6 @@
 """
-EMA Comparison: 25/125 vs 20/100
-Both with aggressive leverage scaling
+Tight Stop Loss Analysis with 0.1% Buffer
+Test: 1.8%, 2.0%, 2.15%
 """
 import pandas as pd
 import numpy as np
@@ -12,25 +12,23 @@ smh_close = df['Close_SMH'].ffill()
 smh_low = df['Low_SMH'].ffill()
 vix_close = df['Close_^VIX'].ffill()
 
-def run_strategy(fast_period, slow_period, name):
-    """Run strategy with given EMA periods"""
-    
-    ema_fast = smh_close.ewm(span=fast_period, adjust=False).mean()
-    ema_slow = smh_close.ewm(span=slow_period, adjust=False).mean()
-    bull = ema_fast > ema_slow
-    
-    equity_series = [100000.0]
+ema_fast = smh_close.ewm(span=25, adjust=False).mean()
+ema_slow = smh_close.ewm(span=125, adjust=False).mean()
+bull = ema_fast > ema_slow
+
+def run_backtest(stop_pct, buffer_pct, name):
+    equity_series = []
     equity = 100000.0
     position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
     
-    trades = 0
-    stops = 0
-    bear_exits = 0
+    stop_count = 0
+    bear_exit_count = 0
+    entry_count = 0
     
-    # Start after warmup
-    start_idx = slow_period
+    # Effective stop = stop_pct + buffer_pct
+    effective_stop = stop_pct + buffer_pct
     
-    for i in range(start_idx, len(df)):
+    for i in range(125, len(df)):
         if pd.isna(smh_close.iloc[i]) or pd.isna(vix_close.iloc[i]):
             continue
         
@@ -40,197 +38,117 @@ def run_strategy(fast_period, slow_period, name):
             worst_equity = position['entry_equity'] + position['shares'] * (worst_price - position['entry'])
             dd = (worst_equity - position['entry_equity']) / position['entry_equity']
             
-            if dd <= -0.02:
-                pnl = -(position['entry_equity'] * 0.02)
+            if dd <= -effective_stop:
+                pnl = -(position['entry_equity'] * stop_pct)
                 equity = position['entry_equity'] + pnl
                 position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
-                stops += 1
+                stop_count += 1
         
         # BEAR EXIT
         if position['shares'] > 0 and not bull.iloc[i]:
             pnl = position['shares'] * (smh_close.iloc[i] - position['entry'])
             equity = position['entry_equity'] + pnl
             position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
-            bear_exits += 1
+            bear_exit_count += 1
         
-        # ENTRY with aggressive leverage
+        # ENTRY
         if position['shares'] == 0 and bull.iloc[i]:
             vix = vix_close.iloc[i]
-            if vix < 12:
-                lev = 3.75
-            elif vix < 13:
-                lev = 3.5
-            elif vix < 14:
-                lev = 3.25
-            else:
-                lev = 3.0
+            lev = 3.75 if vix < 12 else (3.5 if vix < 13 else (3.25 if vix < 14 else 3.0))
             
             entry_price = smh_close.iloc[i]
             shares = (equity * lev) / entry_price
             position = {'shares': shares, 'entry': entry_price, 'entry_equity': equity}
-            trades += 1
+            entry_count += 1
         
         # EOD
-        if position['shares'] > 0:
-            eod_equity = equity + position['shares'] * (smh_close.iloc[i] - position['entry'])
-        else:
-            eod_equity = equity
-        
+        eod_equity = equity + (position['shares'] * (smh_close.iloc[i] - position['entry']) if position['shares'] > 0 else 0)
         equity_series.append(eod_equity)
     
-    # Statistics
+    # Stats
     equity_array = np.array(equity_series)
-    daily_returns = np.diff(equity_array) / equity_array[:-1]
-    
     initial = equity_array[0]
     final = equity_array[-1]
-    total_return = (final / initial - 1) * 100
+    
     years = len(equity_array) / 252
     cagr = (pow(final / initial, 1/years) - 1) * 100
     
-    # Drawdown
     peak = equity_array[0]
-    max_dd_abs = 0
-    max_dd_pct = 0
+    max_dd = 0
     for e in equity_array:
         if e > peak:
             peak = e
-        dd = peak - e
-        dd_pct = (dd / peak) * 100
-        if dd > max_dd_abs:
-            max_dd_abs = dd
-            max_dd_pct = dd_pct
+        dd = (peak - e) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
     
-    # Risk metrics
-    mean_ret = daily_returns.mean()
-    std_ret = daily_returns.std()
-    annual_vol = std_ret * np.sqrt(252) * 100
-    sharpe = (mean_ret * 252) / (std_ret * np.sqrt(252)) if std_ret > 0 else 0
-    mar = cagr / max_dd_pct if max_dd_pct > 0 else 0
+    mar = cagr / max_dd if max_dd > 0 else 0
     
     return {
         'name': name,
-        'ema_config': f'{fast_period}/{slow_period}',
-        'days': len(equity_array),
-        'years': years,
+        'stop_%': stop_pct * 100,
+        'buffer_%': buffer_pct * 100,
+        'effective_%': effective_stop * 100,
         'final': final,
-        'total_return': total_return,
         'cagr': cagr,
-        'max_dd_pct': max_dd_pct,
-        'max_dd_abs': max_dd_abs,
-        'annual_vol': annual_vol,
-        'sharpe': sharpe,
+        'max_dd': max_dd,
         'mar': mar,
-        'max_daily_loss': daily_returns.min() * 100,
-        'max_daily_gain': daily_returns.max() * 100,
-        'trades': trades,
-        'stops': stops,
-        'bear_exits': bear_exits,
-        'equity_curve': equity_array
+        'stops': stop_count,
+        'entries': entry_count
     }
 
-print("=" * 80)
-print("EMA CONFIGURATION COMPARISON")
-print("Leverage: 3.0x base → 3.25x (VIX<14) → 3.5x (VIX<13) → 3.75x (VIX<12)")
-print("=" * 80)
+print("=" * 90)
+print("TIGHT STOP LOSS ANALYSIS - 0.1% Buffer")
+print("Period: July 2022 - Jan 2026")
+print("=" * 90)
 
-# Run both
-results_25_125 = run_strategy(25, 125, "EMA 25/125")
-results_20_100 = run_strategy(20, 100, "EMA 20/100")
-
-def print_results(r):
-    print(f"\n{'='*80}")
-    print(f"{r['name']} ({r['ema_config']})")
-    print(f"{'='*80}")
-    print(f"\n💰 PERFORMANCE:")
-    print(f"  Trading Days: {r['days']}")
-    print(f"  Years: {r['years']:.2f}")
-    print(f"  Final Equity: ${r['final']:,.2f}")
-    print(f"  Total Return: {r['total_return']:.2f}%")
-    print(f"  CAGR: {r['cagr']:.2f}%")
+# Run all three with 0.1% buffer
+results = []
+for stop_pct, name in [(0.018, "1.8%"), (0.020, "2.0%"), (0.0215, "2.15%")]:
+    result = run_backtest(stop_pct, 0.001, name)  # 0.1% buffer
+    results.append(result)
     
-    print(f"\n📉 RISK:")
-    print(f"  Max DD: {r['max_dd_pct']:.2f}% (${r['max_dd_abs']:,.2f})")
-    print(f"  Annual Vol: {r['annual_vol']:.2f}%")
-    print(f"  Sharpe: {r['sharpe']:.2f}")
-    print(f"  MAR Ratio: {r['mar']:.2f}")
-    print(f"  Max Daily Loss: {r['max_daily_loss']:.2f}%")
-    print(f"  Max Daily Gain: {r['max_daily_gain']:.2f}%")
-    
-    print(f"\n📊 TRADES:")
-    print(f"  Total Entries: {r['trades']}")
-    print(f"  Stops: {r['stops']}")
-    print(f"  Bear Exits: {r['bear_exits']}")
+    print(f"\n{name} Stop (Effective {result['effective_%']:.2f}%):")
+    print(f"  CAGR: {result['cagr']:.2f}%")
+    print(f"  Max DD: {result['max_dd']:.2f}%")
+    print(f"  MAR Ratio: {result['mar']:.2f}")
+    print(f"  Stops Hit: {result['stops']}")
+    print(f"  Entries: {result['entries']}")
 
-print_results(results_25_125)
-print_results(results_20_100)
+# Comparison table
+print("\n" + "=" * 90)
+print("COMPARISON TABLE")
+print("=" * 90)
 
-# COMPARISON
-print(f"\n{'='*80}")
-print("HEAD-TO-HEAD COMPARISON")
-print(f"{'='*80}")
+df_results = pd.DataFrame(results)
+print(f"\n{'Stop':<8} {'Effective':<12} {'CAGR':<10} {'Max DD':<10} {'MAR':<10} {'Stops':<10}")
+print("-" * 85)
+for _, row in df_results.iterrows():
+    print(f"{row['stop_%']:>6.2f}% {row['effective_%']:>10.2f}% {row['cagr']:>8.2f}% {row['max_dd']:>8.2f}% {row['mar']:>8.2f} {row['stops']:>8}")
 
-comparison = [
-    ("CAGR", results_25_125['cagr'], results_20_100['cagr'], "%", True),
-    ("Max DD", results_25_125['max_dd_pct'], results_20_100['max_dd_pct'], "%", False),
-    ("Sharpe", results_25_125['sharpe'], results_20_100['sharpe'], "", True),
-    ("MAR Ratio", results_25_125['mar'], results_20_100['mar'], "", True),
-    ("Annual Vol", results_25_125['annual_vol'], results_20_100['annual_vol'], "%", False),
-    ("Total Trades", results_25_125['trades'], results_20_100['trades'], "", None),
-    ("Stops", results_25_125['stops'], results_20_100['stops'], "", None),
-]
+print("\n" + "=" * 90)
+print("ANALYSIS")
+print("=" * 90)
 
-print(f"\n{'Metric':<20} {'25/125':<15} {'20/100':<15} {'Winner':<10}")
-print("-" * 70)
+best_mar = df_results.loc[df_results['mar'].idxmax()]
+best_cagr = df_results.loc[df_results['cagr'].idxmax()]
+most_stops = df_results.loc[df_results['stops'].idxmax()]
 
-for metric, val1, val2, unit, higher_better in comparison:
-    if higher_better is None:
-        winner = "-"
-    elif higher_better:
-        winner = "25/125" if val1 > val2 else "20/100"
-    else:
-        winner = "25/125" if val1 < val2 else "20/100"
-    
-    print(f"{metric:<20} {val1:>10.2f}{unit:<4} {val2:>10.2f}{unit:<4} {winner:<10}")
+print(f"\nBest CAGR: {best_cagr['name']} ({best_cagr['cagr']:.2f}%)")
+print(f"Best MAR: {best_mar['name']} (MAR {best_mar['mar']:.2f})")
+print(f"Most Disciplined: {most_stops['name']} ({most_stops['stops']} stops)")
 
-print("\n" + "=" * 80)
+print("\n" + "=" * 90)
 print("RECOMMENDATION")
-print("=" * 80)
+print("=" * 90)
 
-# Simple scoring
-score_25_125 = 0
-score_20_100 = 0
-
-if results_25_125['cagr'] > results_20_100['cagr']:
-    score_25_125 += 2
+if best_mar['name'] == best_cagr['name']:
+    print(f"✅ CLEAR WINNER: {best_mar['name']}")
+    print(f"   Best CAGR AND best MAR ratio")
 else:
-    score_20_100 += 2
+    print(f"⚖️  TRADE-OFF:")
+    print(f"   {best_cagr['name']}: Highest returns ({best_cagr['cagr']:.2f}% CAGR)")
+    print(f"   {best_mar['name']}: Best risk-adjusted (MAR {best_mar['mar']:.2f})")
+    print(f"\n   Recommend: {best_mar['name']} for better risk management")
 
-if results_25_125['max_dd_pct'] < results_20_100['max_dd_pct']:
-    score_25_125 += 2
-else:
-    score_20_100 += 2
-
-if results_25_125['sharpe'] > results_20_100['sharpe']:
-    score_25_125 += 2
-else:
-    score_20_100 += 2
-
-if results_25_125['mar'] > results_20_100['mar']:
-    score_25_125 += 1
-else:
-    score_20_100 += 1
-
-if score_25_125 > score_20_100:
-    print(f"🏆 WINNER: EMA 25/125")
-    print(f"   Score: {score_25_125} vs {score_20_100}")
-    print(f"   Deploy this configuration to IBKR")
-elif score_20_100 > score_25_125:
-    print(f"🏆 WINNER: EMA 20/100")
-    print(f"   Score: {score_20_100} vs {score_25_125}")
-    print(f"   Deploy this configuration to IBKR")
-else:
-    print(f"⚖️  TIE: Both configurations perform similarly")
-    print(f"   Recommend EMA 25/125 (more conservative)")
-
-print("=" * 80)
+print("=" * 90)

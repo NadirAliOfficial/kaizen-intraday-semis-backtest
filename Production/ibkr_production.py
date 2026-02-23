@@ -24,7 +24,7 @@ EXCHANGE = "ARCA"
 # Strategy Parameters
 EMA_FAST = 25
 EMA_SLOW = 125
-STOP_LOSS_PCT = 0.02  # -2%
+STOP_LOSS_PCT = 0.018  # -1.8%
 
 # Leverage by VIX
 LEV_BASE = 3.0
@@ -281,7 +281,8 @@ class ProductionTradingSystem:
                 self.position_entry = fill_price
                 
                 # Place protective stop
-                stop_price = fill_price * (1 - STOP_LOSS_PCT - 0.005)  # -2.5% buffer
+                # stop_price = fill_price * (1 - STOP_LOSS_PCT - 0.005)  # -2.5% buffer
+                stop_price = fill_price * (1 - STOP_LOSS_PCT - 0.001)  # -1.9% effective
                 self.place_stop_order(qty, stop_price)
                 
                 log.info(f"✅ POSITION OPENED: {qty} @ ${fill_price:.2f}")
