@@ -109,12 +109,14 @@ class ProductionSystem:
         log.info(f"✅ EMAs: {self.ema_25:.2f} / {self.ema_125:.2f} | {'BULL' if self.bull_signal else 'BEAR'}")
     
     def sync_position(self):
-        """Detect existing position"""
+        """Detect existing position and synchronize stops"""
         positions = self.ib.positions()
+        has_position = False
         
         for pos in positions:
             if pos.contract.symbol == SYMBOL:
                 self.position_qty = pos.position
+                has_position = True
                 
                 portfolio = self.ib.portfolio()
                 for item in portfolio:
@@ -123,9 +125,48 @@ class ProductionSystem:
                         break
                 
                 log.info(f"📍 Position: {self.position_qty} @ ${self.position_entry:.2f}")
-                return
+                break
         
-        log.info("📍 No position")
+        # Synchronize stops with IBKR
+        self.sync_stops(has_position)
+        
+        if not has_position:
+            log.info("📍 No position")
+    
+    def sync_stops(self, has_position):
+        """Synchronize stop orders with IBKR state"""
+        try:
+            # Get all open orders
+            open_orders = self.ib.openOrders()
+            smh_stops = [o for o in open_orders 
+                        if o.contract.symbol == SYMBOL 
+                        and o.order.orderType == 'STP']
+            
+            if has_position and len(smh_stops) == 0:
+                # Position exists but no stop - CREATE
+                log.warning("⚠️  Position without stop - creating")
+                stop_price = self.position_entry * (1 - STOP_PCT)
+                self.place_stop(self.position_qty, stop_price)
+                
+            elif has_position and len(smh_stops) > 0:
+                # Position exists with stop - VERIFY
+                stop = smh_stops[0]
+                self.stop_order_id = stop.order.orderId
+                log.info(f"✅ Stop verified: {stop.order.auxPrice:.2f}")
+                
+                # Cancel extra stops
+                for extra in smh_stops[1:]:
+                    self.ib.cancelOrder(extra.order.orderId)
+                    log.warning(f"⚠️  Cancelled duplicate stop")
+                    
+            elif not has_position and len(smh_stops) > 0:
+                # No position but stops exist - CANCEL orphans
+                for stop in smh_stops:
+                    self.ib.cancelOrder(stop.order.orderId)
+                    log.warning(f"⚠️  Cancelled orphan stop")
+                    
+        except Exception as e:
+            log.error(f"Stop sync error: {e}")
     
     def get_account_value(self):
         """Get NetLiquidation"""
@@ -345,8 +386,38 @@ class ProductionSystem:
                 if close and close > 0:
                     self.update_emas(close)
                     
+                    # Bear exit
                     if self.position_qty > 0 and not self.bull_signal:
                         self.exit("BEAR")
+                    
+                    # Rebalancing (if still BULL)
+                    elif self.position_qty > 0 and self.bull_signal:
+                        equity = self.get_account_value()
+                        leverage = self.get_leverage()
+                        target_notional = equity * leverage
+                        target_qty = int(target_notional / close)
+                        
+                        # Current position value at entry cost
+                        current_notional = self.position_qty * self.position_entry
+                        notional_diff = abs(target_notional - current_notional)
+                        
+                        # Rebalance if difference > $50
+                        if notional_diff > 50:
+                            qty_diff = target_qty - self.position_qty
+                            
+                            if qty_diff > 0:
+                                log.info(f"📊 Rebalance UP: +{qty_diff} shares (${notional_diff:,.0f})")
+                                self.place_moc("BUY", qty_diff)
+                            elif qty_diff < 0:
+                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares (${notional_diff:,.0f})")
+                                self.place_moc("SELL", abs(qty_diff))
+                            
+                            self.position_qty = target_qty
+                            
+                            # Update stop
+                            self.cancel_stop()
+                            stop_price = close * (1 - STOP_PCT)
+                            self.place_stop(self.position_qty, stop_price)
             
         except Exception as e:
             log.error(f"Cycle error: {e}")
