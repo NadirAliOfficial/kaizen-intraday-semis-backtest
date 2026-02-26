@@ -390,34 +390,50 @@ class ProductionSystem:
                     if self.position_qty > 0 and not self.bull_signal:
                         self.exit("BEAR")
                     
-                    # Rebalancing (if still BULL)
+                    # If still in position
                     elif self.position_qty > 0 and self.bull_signal:
+                        # 1. TRAILING STOP (independent, price-based)
+                        new_stop = close * (1 - STOP_PCT)
+                        
+                        # Get current stop price
+                        current_stop = self.position_entry * (1 - STOP_PCT)
+                        if self.stop_order_id:
+                            try:
+                                orders = self.ib.openOrders()
+                                for o in orders:
+                                    if o.order.orderId == self.stop_order_id:
+                                        current_stop = o.order.auxPrice
+                                        break
+                            except:
+                                pass
+                        
+                        # Move stop UP only
+                        if new_stop > current_stop:
+                            log.info(f"📈 Trailing stop: ${current_stop:.2f} → ${new_stop:.2f}")
+                            self.cancel_stop()
+                            self.place_stop(self.position_qty, new_stop)
+                        
+                        # 2. REBALANCING (independent of stop)
                         equity = self.get_account_value()
                         leverage = self.get_leverage()
                         target_notional = equity * leverage
                         target_qty = int(target_notional / close)
                         
-                        # Current position value at entry cost
-                        current_notional = self.position_qty * self.position_entry
+                        current_notional = self.position_qty * close
                         notional_diff = abs(target_notional - current_notional)
                         
-                        # Rebalance if difference > $50
                         if notional_diff > 50:
                             qty_diff = target_qty - self.position_qty
                             
                             if qty_diff > 0:
-                                log.info(f"📊 Rebalance UP: +{qty_diff} shares (${notional_diff:,.0f})")
+                                log.info(f"📊 Rebalance UP: +{qty_diff} shares")
                                 self.place_moc("BUY", qty_diff)
                             elif qty_diff < 0:
-                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares (${notional_diff:,.0f})")
+                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares")
                                 self.place_moc("SELL", abs(qty_diff))
                             
                             self.position_qty = target_qty
-                            
-                            # Update stop
-                            self.cancel_stop()
-                            stop_price = close * (1 - STOP_PCT)
-                            self.place_stop(self.position_qty, stop_price)
+                            # Stop remains unchanged (trailing handled above)
             
         except Exception as e:
             log.error(f"Cycle error: {e}")
