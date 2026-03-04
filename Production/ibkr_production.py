@@ -1,13 +1,13 @@
 """
-IBKR PRODUCTION TRADING SYSTEM - HARDENED
-EMA 25/125 Strategy with Full Safeguards
+IBKR PRODUCTION SYSTEM - FINAL
+Exact logic matching clean backtest
 Author: Nadir Ali
-Version: 1.0 Production
+Version: 2.0 FINAL
 """
 import time
 import logging
 from datetime import datetime, time as dt_time
-from ib_insync import IB, Stock, Order, util
+from ib_insync import IB, Stock, Order, util, Index
 import pandas as pd
 import pytz
 
@@ -15,7 +15,7 @@ import pytz
 # CONFIGURATION
 # ============================================================================
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7497  # 7497 = LIVE, 7496 = PAPER
+IBKR_PORT = 4002  # 4002 = PAPER, 4001 = LIVE (Gateway)
 CLIENT_ID = 1
 
 SYMBOL = "SMH"
@@ -24,7 +24,7 @@ EXCHANGE = "ARCA"
 # Strategy Parameters
 EMA_FAST = 25
 EMA_SLOW = 125
-STOP_LOSS_PCT = 0.018  # -1.8%
+STOP_PCT = 0.019  # 1.9% stop on underlying
 
 # Leverage by VIX
 LEV_BASE = 3.0
@@ -48,49 +48,46 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ============================================================================
-# PRODUCTION TRADING SYSTEM
+# PRODUCTION SYSTEM
 # ============================================================================
-class ProductionTradingSystem:
+class ProductionSystem:
     def __init__(self):
         self.ib = None
         self.smh = Stock(SYMBOL, EXCHANGE, "USD")
+        self.vix = Index('VIX', 'CBOE')
         
         self.position_qty = 0
         self.position_entry = 0
-        self.day_start_equity = 0
         self.stop_order_id = None
+        self.stopped_today = False
         
         self.connect()
     
     def connect(self):
-        """Connect to IBKR with retry logic"""
+        """Connect to IBKR"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 self.ib = IB()
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
-                self.ib.reqMarketDataType(1)  # Live data
+                self.ib.reqMarketDataType(1)
                 
-                log.info(f"✅ Connected to IBKR (Port {IBKR_PORT})")
+                log.info(f"✅ Connected (Port {IBKR_PORT})")
                 
-                # Initialize EMAs
                 self.initialize_emas()
-                
-                # Detect existing position
                 self.sync_position()
                 
                 return True
                 
             except Exception as e:
-                log.error(f"Connection attempt {attempt+1} failed: {e}")
+                log.error(f"Connect failed: {e}")
                 time.sleep(5)
         
-        log.critical("❌ Failed to connect after 3 attempts")
-        raise ConnectionError("Cannot connect to IBKR")
+        raise ConnectionError("Cannot connect")
     
     def initialize_emas(self):
-        """Load 250 bars and calculate EMAs"""
-        log.info("Loading historical data (250 bars)...")
+        """Load 250 bars"""
+        log.info("Loading 250 bars...")
         
         bars = self.ib.reqHistoricalData(
             self.smh,
@@ -101,10 +98,6 @@ class ProductionTradingSystem:
             useRTH=True
         )
         
-        if len(bars) < EMA_SLOW:
-            log.error(f"Insufficient data: {len(bars)} bars (need {EMA_SLOW})")
-            raise ValueError("Not enough historical data")
-        
         df = util.df(bars)
         df['ema_25'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
         df['ema_125'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -113,100 +106,153 @@ class ProductionTradingSystem:
         self.ema_125 = df['ema_125'].iloc[-1]
         self.bull_signal = self.ema_25 > self.ema_125
         
-        log.info(f"✅ EMAs: 25={self.ema_25:.2f} | 125={self.ema_125:.2f} | Signal={'BULL' if self.bull_signal else 'BEAR'}")
+        log.info(f"✅ EMAs: {self.ema_25:.2f} / {self.ema_125:.2f} | {'BULL' if self.bull_signal else 'BEAR'}")
     
     def sync_position(self):
-        """Detect existing IBKR position on startup"""
+        """Detect existing position and synchronize stops"""
         positions = self.ib.positions()
+        has_position = False
         
         for pos in positions:
             if pos.contract.symbol == SYMBOL:
                 self.position_qty = pos.position
+                has_position = True
                 
-                # Get avg cost from IBKR
                 portfolio = self.ib.portfolio()
                 for item in portfolio:
                     if item.contract.symbol == SYMBOL:
                         self.position_entry = item.averageCost
                         break
                 
-                log.info(f"📍 Existing position detected: {self.position_qty} shares @ ${self.position_entry:.2f}")
-                return
+                log.info(f"📍 Position: {self.position_qty} @ ${self.position_entry:.2f}")
+                break
         
-        log.info("📍 No existing position")
+        # Synchronize stops with IBKR
+        self.sync_stops(has_position)
+        
+        if not has_position:
+            log.info("📍 No position")
+    
+    def sync_stops(self, has_position):
+        """Synchronize stop orders with IBKR state"""
+        try:
+            # Get all open orders
+            open_orders = self.ib.openOrders()
+            smh_stops = [o for o in open_orders 
+                        if o.contract.symbol == SYMBOL 
+                        and o.order.orderType == 'STP']
+            
+            if has_position and len(smh_stops) == 0:
+                # Position exists but no stop - CREATE
+                log.warning("⚠️  Position without stop - creating")
+                stop_price = self.position_entry * (1 - STOP_PCT)
+                self.place_stop(self.position_qty, stop_price)
+                
+            elif has_position and len(smh_stops) > 0:
+                # Position exists with stop - VERIFY
+                stop = smh_stops[0]
+                self.stop_order_id = stop.order.orderId
+                log.info(f"✅ Stop verified: {stop.order.auxPrice:.2f}")
+                
+                # Cancel extra stops
+                for extra in smh_stops[1:]:
+                    self.ib.cancelOrder(extra.order.orderId)
+                    log.warning(f"⚠️  Cancelled duplicate stop")
+                    
+            elif not has_position and len(smh_stops) > 0:
+                # No position but stops exist - CANCEL orphans
+                for stop in smh_stops:
+                    self.ib.cancelOrder(stop.order.orderId)
+                    log.warning(f"⚠️  Cancelled orphan stop")
+                    
+        except Exception as e:
+            log.error(f"Stop sync error: {e}")
     
     def get_account_value(self):
         """Get NetLiquidation"""
         try:
-            account_values = self.ib.accountValues()
-            for v in account_values:
+            for v in self.ib.accountValues():
                 if v.tag == 'NetLiquidation' and v.currency == 'USD':
                     return float(v.value)
-            return 0
-        except Exception as e:
-            log.error(f"Error getting account value: {e}")
-            return 0
+        except:
+            pass
+        return 0
+    
+    def get_vix(self):
+        """Get VIX"""
+        try:
+            ticker = self.ib.reqMktData(self.vix)
+            self.ib.sleep(2)
+            vix = ticker.last if ticker.last == ticker.last else ticker.close
+            return vix if vix > 0 else 15.0
+        except:
+            return 15.0
     
     def get_leverage(self):
-        """VIX-based leverage (defaults to 3.0)"""
-        try:
-            # In production, fetch real VIX if available
-            # For now, use base leverage
-            return LEV_BASE
-        except:
-            return LEV_BASE
+        """VIX-based leverage"""
+        vix = self.get_vix()
+        
+        if vix < 12:
+            lev = LEV_VIX_12
+        elif vix < 13:
+            lev = LEV_VIX_13
+        elif vix < 14:
+            lev = LEV_VIX_14
+        else:
+            lev = LEV_BASE
+        
+        log.info(f"   VIX: {vix:.2f} → {lev}x")
+        return lev
     
     def update_emas(self, price):
-        """Update EMAs with new close price"""
+        """Update EMAs"""
         k_fast = 2 / (EMA_FAST + 1)
         k_slow = 2 / (EMA_SLOW + 1)
         
         self.ema_25 = price * k_fast + self.ema_25 * (1 - k_fast)
         self.ema_125 = price * k_slow + self.ema_125 * (1 - k_slow)
         
-        prev_signal = self.bull_signal
+        prev = self.bull_signal
         self.bull_signal = self.ema_25 > self.ema_125
         
-        if prev_signal != self.bull_signal:
-            log.info(f"📊 SIGNAL CHANGE: {'BULL' if self.bull_signal else 'BEAR'}")
+        if prev != self.bull_signal:
+            log.info(f"📊 SIGNAL: {'BULL' if self.bull_signal else 'BEAR'}")
     
-    def place_moc_order(self, action, quantity):
-        """Place Market-On-Close order"""
+    def place_moc(self, action, qty):
+        """Market-On-Close order"""
         try:
             order = Order()
             order.action = action
-            order.totalQuantity = abs(quantity)
+            order.totalQuantity = abs(qty)
             order.orderType = "MOC"
             order.tif = "DAY"
             
             trade = self.ib.placeOrder(self.smh, order)
             self.ib.sleep(2)
             
-            # Wait for fill
-            max_wait = 30
-            for _ in range(max_wait):
+            for _ in range(30):
                 if trade.orderStatus.status in ['Filled', 'Cancelled']:
                     break
                 self.ib.sleep(1)
             
             if trade.orderStatus.status == 'Filled':
-                fill_price = trade.orderStatus.avgFillPrice
-                log.info(f"✅ {action} filled: {quantity} @ ${fill_price:.2f}")
-                return fill_price
+                fill = trade.orderStatus.avgFillPrice
+                log.info(f"✅ {action} {qty} @ ${fill:.2f}")
+                return fill
             else:
-                log.error(f"❌ Order failed: {trade.orderStatus.status}")
+                log.error(f"❌ Order failed")
                 return None
                 
         except Exception as e:
-            log.error(f"Order placement error: {e}")
+            log.error(f"Order error: {e}")
             return None
     
-    def place_stop_order(self, quantity, stop_price):
-        """Place protective stop order at IBKR"""
+    def place_stop(self, qty, stop_price):
+        """IBKR stop order"""
         try:
             order = Order()
             order.action = "SELL"
-            order.totalQuantity = abs(quantity)
+            order.totalQuantity = abs(qty)
             order.orderType = "STP"
             order.auxPrice = stop_price
             order.tif = "GTC"
@@ -214,101 +260,96 @@ class ProductionTradingSystem:
             trade = self.ib.placeOrder(self.smh, order)
             self.stop_order_id = trade.order.orderId
             
-            log.info(f"🛡️  Stop order placed: {quantity} @ ${stop_price:.2f}")
+            log.info(f"🛡️  Stop @ ${stop_price:.2f}")
             
         except Exception as e:
-            log.error(f"Stop order error: {e}")
+            log.error(f"Stop error: {e}")
     
-    def cancel_stop_order(self):
-        """Cancel existing stop order"""
+    def cancel_stop(self):
+        """Cancel stop"""
         if self.stop_order_id:
             try:
                 self.ib.cancelOrder(self.stop_order_id)
-                log.info("🛡️  Stop order cancelled")
                 self.stop_order_id = None
-            except Exception as e:
-                log.error(f"Cancel stop error: {e}")
+                log.info("🛡️  Stop cancelled")
+            except:
+                pass
     
-    def check_virtual_stop(self):
-        """Backup virtual stop check"""
-        if self.position_qty == 0 or self.day_start_equity == 0:
+    def check_stop_triggered(self):
+        """Check if IBKR stop hit"""
+        if not self.stop_order_id:
             return False
         
         try:
-            current_equity = self.get_account_value()
-            dd = (current_equity - self.day_start_equity) / self.day_start_equity
+            positions = self.ib.positions()
+            has_pos = any(p.contract.symbol == SYMBOL for p in positions)
             
-            if dd <= -STOP_LOSS_PCT:
-                log.warning(f"🛑 Virtual stop triggered: {dd*100:.2f}%")
-                self.exit_position("VIRTUAL_STOP")
+            if not has_pos and self.position_qty > 0:
+                log.warning("🛑 Stop triggered")
+                self.position_qty = 0
+                self.position_entry = 0
+                self.stop_order_id = None
+                self.stopped_today = True
                 return True
-                
-        except Exception as e:
-            log.error(f"Virtual stop check error: {e}")
+        except:
+            pass
         
         return False
     
-    def enter_position(self):
-        """Enter position with MOC order"""
+    def enter(self):
+        """Entry at 3:55 PM"""
         try:
             equity = self.get_account_value()
             leverage = self.get_leverage()
             
-            # Get current price
             ticker = self.ib.reqMktData(self.smh)
             self.ib.sleep(2)
             price = ticker.last if ticker.last == ticker.last else ticker.close
             
             if not price or price <= 0:
-                log.error("❌ Invalid price, skipping entry")
+                log.error("❌ Invalid price")
                 return
             
-            # Calculate position
-            notional = equity * leverage
-            qty = int(notional / price)
+            qty = int((equity * leverage) / price)
             
             if qty <= 0:
-                log.error("❌ Invalid quantity")
+                log.error("❌ Invalid qty")
                 return
             
-            log.info(f"📊 Entry signal: Equity=${equity:,.0f} Lev={leverage}x Price=${price:.2f} Qty={qty}")
+            log.info(f"📊 Entry: ${equity:,.0f} × {leverage}x = {qty} shares")
             
-            # Place MOC order
-            fill_price = self.place_moc_order("BUY", qty)
+            fill = self.place_moc("BUY", qty)
             
-            if fill_price:
+            if fill:
                 self.position_qty = qty
-                self.position_entry = fill_price
+                self.position_entry = fill
                 
-                # Place protective stop
-                # stop_price = fill_price * (1 - STOP_LOSS_PCT - 0.005)  # -2.5% buffer
-                stop_price = fill_price * (1 - STOP_LOSS_PCT - 0.001)  # -1.9% effective
-                self.place_stop_order(qty, stop_price)
+                # Stop at 1.9% below entry
+                stop_price = fill * (1 - STOP_PCT)
+                self.place_stop(qty, stop_price)
                 
-                log.info(f"✅ POSITION OPENED: {qty} @ ${fill_price:.2f}")
+                log.info(f"✅ OPENED: {qty} @ ${fill:.2f}")
             
         except Exception as e:
             log.error(f"Entry error: {e}")
     
-    def exit_position(self, reason):
-        """Exit position with MOC order"""
+    def exit(self, reason):
+        """Exit position"""
         if self.position_qty == 0:
             return
         
         try:
-            log.info(f"🚪 Exit signal: {reason}")
+            log.info(f"🚪 Exit: {reason}")
             
-            # Cancel stop order
-            self.cancel_stop_order()
+            self.cancel_stop()
             
-            # Place MOC sell
-            fill_price = self.place_moc_order("SELL", self.position_qty)
+            fill = self.place_moc("SELL", self.position_qty)
             
-            if fill_price:
-                pnl = self.position_qty * (fill_price - self.position_entry)
-                pnl_pct = (fill_price / self.position_entry - 1) * 100
+            if fill:
+                pnl = self.position_qty * (fill - self.position_entry)
+                pct = (fill / self.position_entry - 1) * 100
                 
-                log.info(f"✅ POSITION CLOSED: {self.position_qty} @ ${fill_price:.2f} | P&L: ${pnl:,.0f} ({pnl_pct:+.2f}%)")
+                log.info(f"✅ CLOSED: {self.position_qty} @ ${fill:.2f} | ${pnl:,.0f} ({pct:+.2f}%)")
                 
                 self.position_qty = 0
                 self.position_entry = 0
@@ -317,25 +358,47 @@ class ProductionTradingSystem:
             log.error(f"Exit error: {e}")
     
     def daily_cycle(self):
-        """Main trading logic"""
+        """Main loop"""
         try:
             now = datetime.now(pytz.timezone('US/Eastern')).time()
             
-            # Morning: Set day start equity
-            if now < dt_time(9, 35) and self.day_start_equity == 0:
-                self.day_start_equity = self.get_account_value()
-                log.info(f"📅 Day start: ${self.day_start_equity:,.2f}")
+            # HEARTBEAT LOGGING (every 5 minutes, 24/7)
+            current_minute = datetime.now(pytz.timezone('US/Eastern')).minute
+            if current_minute % 5 == 0 and datetime.now(pytz.timezone('US/Eastern')).second < 15:
+                try:
+                    ticker = self.ib.reqMktData(self.smh)
+                    self.ib.sleep(2)
+                    price = ticker.last if ticker.last == ticker.last else ticker.close
+                except:
+                    price = None
+                
+                log.info("=" * 60)
+                log.info(f"💓 HEARTBEAT | {datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S ET')}")
+                log.info(f"   SMH Price: ${price:.2f}" if price else "   SMH Price: Market Closed")
+                log.info(f"   EMA 25: {self.ema_25:.2f}")
+                log.info(f"   EMA 125: {self.ema_125:.2f}")
+                log.info(f"   Signal: {'BULL ✅' if self.bull_signal else 'BEAR ❌'}")
+                log.info(f"   Position: {self.position_qty} shares")
+                if self.position_qty > 0:
+                    log.info(f"   Entry: ${self.position_entry:.2f}")
+                log.info("=" * 60)
             
-            # Continuous: Virtual stop check (backup)
+            # Morning reset
+            if now < dt_time(9, 35):
+                self.stopped_today = False
+            
+            # Check stop
             if self.position_qty > 0:
-                self.check_virtual_stop()
+                self.check_stop_triggered()
             
-            # 3:55 PM: Entry
+            # 3:55 PM Entry (or re-entry)
             if now >= ENTRY_TIME and now < dt_time(15, 58):
                 if self.position_qty == 0 and self.bull_signal:
-                    self.enter_position()
+                    if self.stopped_today:
+                        log.info("🔄 Re-entering after stop")
+                    self.enter()
             
-            # 4:00 PM: Update EMAs and rebalance/exit
+            # 4:00 PM Update & Exit
             if now >= MARKET_CLOSE and now < dt_time(16, 5):
                 ticker = self.ib.reqMktData(self.smh)
                 self.ib.sleep(2)
@@ -346,10 +409,32 @@ class ProductionTradingSystem:
                     
                     # Bear exit
                     if self.position_qty > 0 and not self.bull_signal:
-                        self.exit_position("BEAR_SIGNAL")
+                        self.exit("BEAR")
                     
-                    # Rebalancing logic (if BULL and in position)
+                    # If still in position
                     elif self.position_qty > 0 and self.bull_signal:
+                        # 1. TRAILING STOP (independent, price-based)
+                        new_stop = close * (1 - STOP_PCT)
+                        
+                        # Get current stop price
+                        current_stop = self.position_entry * (1 - STOP_PCT)
+                        if self.stop_order_id:
+                            try:
+                                orders = self.ib.openOrders()
+                                for o in orders:
+                                    if o.order.orderId == self.stop_order_id:
+                                        current_stop = o.order.auxPrice
+                                        break
+                            except:
+                                pass
+                        
+                        # Move stop UP only
+                        if new_stop > current_stop:
+                            log.info(f"📈 Trailing stop: ${current_stop:.2f} → ${new_stop:.2f}")
+                            self.cancel_stop()
+                            self.place_stop(self.position_qty, new_stop)
+                        
+                        # 2. REBALANCING (independent of stop)
                         equity = self.get_account_value()
                         leverage = self.get_leverage()
                         target_notional = equity * leverage
@@ -358,52 +443,41 @@ class ProductionTradingSystem:
                         current_notional = self.position_qty * close
                         notional_diff = abs(target_notional - current_notional)
                         
-                        # Rebalance if difference > $50
                         if notional_diff > 50:
                             qty_diff = target_qty - self.position_qty
                             
                             if qty_diff > 0:
-                                log.info(f"📊 Rebalancing UP: +{qty_diff} shares (${notional_diff:,.0f} new capital)")
-                                self.place_moc_order("BUY", qty_diff)
-                                self.position_qty = target_qty
+                                log.info(f"📊 Rebalance UP: +{qty_diff} shares")
+                                self.place_moc("BUY", qty_diff)
                             elif qty_diff < 0:
-                                log.info(f"📊 Rebalancing DOWN: {qty_diff} shares (${notional_diff:,.0f} reduction)")
-                                self.place_moc_order("SELL", abs(qty_diff))
-                                self.position_qty = target_qty
+                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares")
+                                self.place_moc("SELL", abs(qty_diff))
                             
-                            # Update stop order
-                            self.cancel_stop_order()
-                            stop_price = close * (1 - STOP_LOSS_PCT - 0.005)
-                            self.place_stop_order(self.position_qty, stop_price)
-                        else:
-                            log.info(f"✅ No rebalancing needed (${notional_diff:.0f} difference)")
-            
-            # After hours: Reset
-            if now > dt_time(17, 0):
-                self.day_start_equity = 0
+                            self.position_qty = target_qty
+                            # Stop remains unchanged (trailing handled above)
             
         except Exception as e:
-            log.error(f"Daily cycle error: {e}")
+            log.error(f"Cycle error: {e}")
     
     def run(self):
-        """Main event loop with reconnection"""
-        log.info("🚀 Production system started")
+        """Main loop"""
+        log.info("🚀 PRODUCTION STARTED")
+        log.info(f"   EMA {EMA_FAST}/{EMA_SLOW} | Stop {STOP_PCT*100}%")
         
         try:
             while True:
-                # Check connection
                 if not self.ib.isConnected():
-                    log.warning("⚠️  Disconnected, reconnecting...")
+                    log.warning("⚠️  Reconnecting...")
                     self.connect()
                 
                 self.daily_cycle()
-                time.sleep(10)  # Check every 10 seconds
+                time.sleep(10)
                 
         except KeyboardInterrupt:
-            log.info("⏹️  Manual shutdown")
+            log.info("⏹️  Shutdown")
             self.ib.disconnect()
         except Exception as e:
-            log.critical(f"Fatal error: {e}")
+            log.critical(f"Fatal: {e}")
             self.ib.disconnect()
 
 # ============================================================================
@@ -411,10 +485,9 @@ class ProductionTradingSystem:
 # ============================================================================
 if __name__ == "__main__":
     log.info("=" * 80)
-    log.info("IBKR PRODUCTION TRADING SYSTEM")
-    log.info(f"Strategy: EMA {EMA_FAST}/{EMA_SLOW}")
-    log.info(f"Port: {IBKR_PORT} ({'LIVE' if IBKR_PORT == 7497 else 'PAPER'})")
+    log.info("PRODUCTION SYSTEM - FINAL")
+    log.info(f"Port: {IBKR_PORT} ({'LIVE' if IBKR_PORT == 4001 else 'PAPER'})")
     log.info("=" * 80)
     
-    system = ProductionTradingSystem()
+    system = ProductionSystem()
     system.run()
