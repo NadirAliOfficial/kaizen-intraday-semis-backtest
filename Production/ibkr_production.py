@@ -4,6 +4,8 @@ Exact logic matching clean backtest
 Author: Nadir Ali
 Version: 2.0 FINAL
 """
+import sys
+import io
 import time
 import logging
 from datetime import datetime, time as dt_time
@@ -41,8 +43,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.FileHandler('trading.log'),
-        logging.StreamHandler()
+        logging.FileHandler('trading.log', encoding='utf-8'),
+        logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', write_through=True))
     ]
 )
 log = logging.getLogger(__name__)
