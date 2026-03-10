@@ -76,7 +76,13 @@ Write-Step "Downloading latest IBC from GitHub..."
 try {
     $release = Invoke-RestMethod "https://api.github.com/repos/IbcAlpha/IBC/releases/latest" -UseBasicParsing
     $asset   = $release.assets | Where-Object { $_.name -like "IBCWindows*.zip" } | Select-Object -First 1
-    if (-not $asset) { Write-Fail "IBCWindows zip not found in GitHub release." }
+    if (-not $asset) {
+        $asset = $release.assets | Where-Object { $_.name -like "*Windows*.zip" } | Select-Object -First 1
+    }
+    if (-not $asset) {
+        $asset = $release.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+    }
+    if (-not $asset) { Write-Fail "No zip found in IBC GitHub release. Assets: $(($release.assets | Select-Object -ExpandProperty name) -join ', ')" }
     $zipPath = "$env:TEMP\IBC_latest.zip"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
     Write-OK "Downloaded IBC $($release.tag_name)"
