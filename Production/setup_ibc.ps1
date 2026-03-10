@@ -6,7 +6,7 @@
     IB Gateway will launch and log in automatically.
 
 .WHAT THIS DOES
-    1. Prompts for IBKR credentials + Windows password (nothing is hardcoded)
+    1. Uses pre-configured IBKR paper account credentials
     2. Detects your installed IB Gateway version automatically
     3. Downloads the latest IBC release from GitHub
     4. Writes config.ini and StartGateway.bat
@@ -29,6 +29,12 @@
 $GatewayPath = "C:\Jts"
 $IbcPath     = "C:\IBC"
 
+# ─── Credentials (paper account) ──────────────────────────────────────────────
+$ibkrUser    = "debamamv07"
+$ibkrPass    = "dev13579"
+$tradingMode = "paper"
+$port        = 4002
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 function Write-Step { param($msg) Write-Host "`n[*] $msg" -ForegroundColor Cyan }
 function Write-OK   { param($msg) Write-Host "    [OK] $msg" -ForegroundColor Green }
@@ -44,34 +50,20 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 Write-Host "  This script will:" -ForegroundColor White
 Write-Host "    - Download and install IBC" -ForegroundColor Gray
-Write-Host "    - Configure auto-login for IB Gateway" -ForegroundColor Gray
+Write-Host "    - Configure auto-login for IB Gateway (paper, port 4002)" -ForegroundColor Gray
 Write-Host "    - Register a boot-time Task Scheduler job" -ForegroundColor Gray
 Write-Host "    - Enable Windows auto-logon" -ForegroundColor Gray
 Write-Host ""
 
-# ─── Step 0: Collect Inputs ───────────────────────────────────────────────────
-Write-Host "  Enter your details below." -ForegroundColor White
-Write-Host "  (Passwords are stored only in local config files, not in this script)" -ForegroundColor Gray
-Write-Host ""
-
-$ibkrUser = Read-Host "  IBKR Username"
-if (-not $ibkrUser) { Write-Fail "Username cannot be empty." }
-
-$ibkrPassSS  = Read-Host "  IBKR Password" -AsSecureString
-$ibkrPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                   [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ibkrPassSS))
-if (-not $ibkrPass) { Write-Fail "Password cannot be empty." }
-
-$modeRaw     = Read-Host "  Trading Mode — type 'live' for live, or press Enter for paper [paper]"
-$tradingMode = if ($modeRaw.Trim().ToLower() -eq "live") { "live" } else { "paper" }
-$port        = if ($tradingMode -eq "live") { 4001 } else { 4002 }
-
+# ─── Step 0: Only ask for Windows password (everything else is pre-configured) ─
+Write-Host "  IBKR credentials are pre-configured (paper account)." -ForegroundColor White
 Write-Host ""
 Write-Host "  Windows auto-logon — enter the password for this Windows account." -ForegroundColor White
 Write-Host "  This is needed so the VPS desktop opens automatically on reboot." -ForegroundColor Gray
-$winPassSS  = Read-Host "  Windows Login Password" -AsSecureString
-$winPass    = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($winPassSS))
+$winPassSS = Read-Host "  Windows Login Password" -AsSecureString
+$winPass   = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($winPassSS))
+if (-not $winPass) { Write-Fail "Windows password cannot be empty." }
 
 Write-Host ""
 Write-Host "  --------------------------------------------------------" -ForegroundColor DarkGray
