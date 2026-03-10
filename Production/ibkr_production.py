@@ -62,6 +62,7 @@ class ProductionSystem:
         self.position_entry = 0
         self.stop_order_id = None
         self.stopped_today = False
+        self._last_heartbeat_minute = -1
         
         self.connect()
     
@@ -72,7 +73,7 @@ class ProductionSystem:
             try:
                 self.ib = IB()
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
-                self.ib.reqMarketDataType(1)
+                self.ib.reqMarketDataType(3)  # 3 = delayed fallback when no live subscription
                 
                 log.info(f"✅ Connected (Port {IBKR_PORT})")
                 
@@ -365,18 +366,22 @@ class ProductionSystem:
             now = datetime.now(pytz.timezone('US/Eastern')).time()
             
             # HEARTBEAT LOGGING (every 5 minutes, 24/7)
-            current_minute = datetime.now(pytz.timezone('US/Eastern')).minute
-            if current_minute % 5 == 0 and datetime.now(pytz.timezone('US/Eastern')).second < 15:
+            now_et = datetime.now(pytz.timezone('US/Eastern'))
+            current_minute = now_et.minute
+            if current_minute % 5 == 0 and current_minute != self._last_heartbeat_minute:
+                self._last_heartbeat_minute = current_minute
                 try:
                     ticker = self.ib.reqMktData(self.smh)
                     self.ib.sleep(2)
-                    price = ticker.last if ticker.last == ticker.last else ticker.close
+                    raw = ticker.last if ticker.last == ticker.last else ticker.close
+                    price = raw if (raw == raw and raw > 0) else None  # filter NaN
+                    self.ib.cancelMktData(self.smh)
                 except:
                     price = None
-                
+
                 log.info("=" * 60)
-                log.info(f"💓 HEARTBEAT | {datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S ET')}")
-                log.info(f"   SMH Price: ${price:.2f}" if price else "   SMH Price: Market Closed")
+                log.info(f"💓 HEARTBEAT | {now_et.strftime('%Y-%m-%d %H:%M:%S ET')}")
+                log.info(f"   SMH Price: ${price:.2f}" if price is not None else "   SMH Price: No data")
                 log.info(f"   EMA 25: {self.ema_25:.2f}")
                 log.info(f"   EMA 125: {self.ema_125:.2f}")
                 log.info(f"   Signal: {'BULL ✅' if self.bull_signal else 'BEAR ❌'}")
