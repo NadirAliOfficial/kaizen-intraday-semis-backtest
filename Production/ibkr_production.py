@@ -21,7 +21,7 @@ IBKR_PORT = 4002  # 4002 = PAPER, 4001 = LIVE (Gateway)
 CLIENT_ID = 1
 
 SYMBOL = "SMH"
-EXCHANGE = "ARCA"
+EXCHANGE = "SMART"
 
 # Strategy Parameters
 EMA_FAST = 25
@@ -49,6 +49,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Suppress noisy ib_insync internal logs
+for _noisy in ('ib_insync.wrapper', 'ib_insync.client', 'ib_insync.ib'):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
 # ============================================================================
 # PRODUCTION SYSTEM
 # ============================================================================
@@ -62,6 +66,8 @@ class ProductionSystem:
         self.position_entry = 0
         self.stop_order_id = None
         self.stopped_today = False
+        self.last_known_price = 0
+        self.order_pending = False
         self._last_heartbeat_minute = -1
         
         self.connect()
@@ -74,7 +80,7 @@ class ProductionSystem:
             try:
                 self.ib = IB()
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
-                self.ib.reqMarketDataType(3)  # 3 = delayed fallback when no live subscription
+                self.ib.reqMarketDataType(4)  # 4 = delayed frozen (works after-hours on TWS)
 
                 log.info(f"✅ Connected (Port {IBKR_PORT})")
 
@@ -108,6 +114,7 @@ class ProductionSystem:
         self.ema_25 = df['ema_25'].iloc[-1]
         self.ema_125 = df['ema_125'].iloc[-1]
         self.bull_signal = self.ema_25 > self.ema_125
+        self.last_known_price = df['close'].iloc[-1]
         
         log.info(f"✅ EMAs: {self.ema_25:.2f} / {self.ema_125:.2f} | {'BULL' if self.bull_signal else 'BEAR'}")
     
@@ -174,13 +181,17 @@ class ProductionSystem:
     def get_account_value(self):
         """Get NetLiquidation"""
         try:
-            self.ib.reqAccountUpdates(True, '')
-            self.ib.sleep(2)
+            summary = self.ib.accountSummary()
+            for v in summary:
+                if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                    return float(v.value)
+        except:
+            pass
+        # fallback: accountValues cache
+        try:
             for v in self.ib.accountValues():
                 if v.tag == 'NetLiquidation' and v.currency == 'USD':
-                    self.ib.reqAccountUpdates(False, '')
                     return float(v.value)
-            self.ib.reqAccountUpdates(False, '')
         except:
             pass
         return 0
@@ -242,12 +253,19 @@ class ProductionSystem:
                     break
                 self.ib.sleep(1)
             
-            if trade.orderStatus.status == 'Filled':
+            status = trade.orderStatus.status
+            if status == 'Filled':
                 fill = trade.orderStatus.avgFillPrice
                 log.info(f"✅ {action} {qty} @ ${fill:.2f}")
                 return fill
+            elif status in ('PreSubmitted', 'Submitted'):
+                log.info(f"📨 Order submitted — {action} {qty} MOC | awaiting fill at market close")
+                return -1  # signals order is live, not yet filled
             else:
-                log.error(f"❌ Order failed")
+                log.error(f"❌ Order rejected — status: {status}")
+                for entry in trade.log:
+                    if entry.errorCode:
+                        log.error(f"   IBKR error {entry.errorCode}: {entry.message}")
                 return None
                 
         except Exception as e:
@@ -305,6 +323,8 @@ class ProductionSystem:
     
     def enter(self):
         """Entry at 3:55 PM"""
+        if self.order_pending:
+            return
         try:
             equity = self.get_account_value()
             leverage = self.get_leverage()
@@ -312,9 +332,13 @@ class ProductionSystem:
             ticker = self.ib.reqMktData(self.smh)
             self.ib.sleep(2)
             price = ticker.last if ticker.last == ticker.last else ticker.close
-            
+            price = price if price == price else None  # NaN guard
             if not price or price <= 0:
-                log.error("❌ Invalid price")
+                price = self.last_known_price  # fallback to last historical close
+                log.warning(f"⚠️  Live price unavailable, using last close: ${price:.2f}")
+
+            if not price or price <= 0:
+                log.error("❌ No price available, skipping entry")
                 return
             
             qty = int((equity * leverage) / price)
@@ -326,8 +350,11 @@ class ProductionSystem:
             log.info(f"📊 Entry: ${equity:,.0f} × {leverage}x = {qty} shares")
             
             fill = self.place_moc("BUY", qty)
-            
-            if fill:
+
+            if fill == -1:
+                self.order_pending = True  # submitted, waiting for MOC fill
+            elif fill and fill > 0:
+                self.order_pending = False
                 self.position_qty = qty
                 self.position_entry = fill
                 
@@ -397,6 +424,7 @@ class ProductionSystem:
             # Morning reset
             if now < dt_time(9, 35):
                 self.stopped_today = False
+                self.order_pending = False
             
             # Check stop
             if self.position_qty > 0:
