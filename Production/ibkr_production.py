@@ -67,26 +67,26 @@ class ProductionSystem:
         self.connect()
     
     def connect(self):
-        """Connect to IBKR"""
-        max_retries = 3
-        for attempt in range(max_retries):
+        """Connect to IBKR — retries indefinitely every 10-15s"""
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 self.ib = IB()
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
                 self.ib.reqMarketDataType(3)  # 3 = delayed fallback when no live subscription
-                
+
                 log.info(f"✅ Connected (Port {IBKR_PORT})")
-                
+
                 self.initialize_emas()
                 self.sync_position()
-                
+
                 return True
-                
+
             except Exception as e:
-                log.error(f"Connect failed: {e}")
-                time.sleep(5)
-        
-        raise ConnectionError("Cannot connect")
+                delay = 10 if attempt % 2 == 0 else 15
+                log.error(f"Connect failed (attempt {attempt}): {e} — retrying in {delay}s...")
+                time.sleep(delay)
     
     def initialize_emas(self):
         """Load 250 bars"""
@@ -174,9 +174,13 @@ class ProductionSystem:
     def get_account_value(self):
         """Get NetLiquidation"""
         try:
+            self.ib.reqAccountUpdates(True, '')
+            self.ib.sleep(2)
             for v in self.ib.accountValues():
                 if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                    self.ib.reqAccountUpdates(False, '')
                     return float(v.value)
+            self.ib.reqAccountUpdates(False, '')
         except:
             pass
         return 0
