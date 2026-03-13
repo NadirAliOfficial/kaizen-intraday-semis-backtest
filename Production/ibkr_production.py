@@ -80,6 +80,7 @@ class ProductionSystem:
             attempt += 1
             try:
                 self.ib = IB()
+                log.info(f"⏳ Connecting to {IBKR_HOST}:{IBKR_PORT} clientId={CLIENT_ID}...")
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
                 self.ib.reqMarketDataType(4)  # 4 = delayed frozen (works after-hours on TWS)
 
