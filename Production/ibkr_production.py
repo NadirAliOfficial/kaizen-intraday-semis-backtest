@@ -179,21 +179,37 @@ class ProductionSystem:
             log.error(f"Stop sync error: {e}")
     
     def get_account_value(self):
-        """Get NetLiquidation"""
-        try:
-            summary = self.ib.accountSummary()
-            for v in summary:
-                if v.tag == 'NetLiquidation' and v.currency == 'USD':
-                    return float(v.value)
-        except:
-            pass
-        # fallback: accountValues cache
-        try:
-            for v in self.ib.accountValues():
-                if v.tag == 'NetLiquidation' and v.currency == 'USD':
-                    return float(v.value)
-        except:
-            pass
+        """Get NetLiquidation — tries all methods with retries"""
+        for attempt in range(3):
+            # Method 1: accountSummary (fresh request)
+            try:
+                summary = self.ib.accountSummary()
+                for v in summary:
+                    if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                        val = float(v.value)
+                        if val > 0:
+                            return val
+            except:
+                pass
+
+            # Method 2: reqAccountUpdates then accountValues
+            try:
+                self.ib.reqAccountUpdates(True, '')
+                self.ib.sleep(3)
+                for v in self.ib.accountValues():
+                    if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                        val = float(v.value)
+                        if val > 0:
+                            self.ib.reqAccountUpdates(False, '')
+                            return val
+                self.ib.reqAccountUpdates(False, '')
+            except:
+                pass
+
+            log.warning(f"⚠️  Account value attempt {attempt+1} returned 0, retrying...")
+            self.ib.sleep(2)
+
+        log.error("❌ Could not fetch account value after 3 attempts")
         return 0
     
     def get_vix(self):
