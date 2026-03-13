@@ -35,8 +35,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(14, 43)  # TEST — restore to dt_time(15, 55)
-ENTRY_TIME_END = dt_time(14, 46)  # TEST — restore to dt_time(15, 58)
+ENTRY_TIME     = dt_time(14, 48)  # TEST — restore to dt_time(15, 55)
+ENTRY_TIME_END = dt_time(14, 51)  # TEST — restore to dt_time(15, 58)
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
@@ -87,7 +87,7 @@ class ProductionSystem:
                 accounts = self.ib.managedAccounts()
                 self._account = accounts[0] if accounts else ''
                 if self._account:
-                    self.ib.reqAccountUpdates(True, self._account)
+                    self.ib.reqAccountUpdates(True)
                     self.ib.sleep(5)  # wait for account data to populate
                     log.info(f"✅ Account: {self._account}")
 
@@ -215,7 +215,7 @@ class ProductionSystem:
 
             # Method 3: re-subscribe and wait
             try:
-                self.ib.reqAccountUpdates(True, account)
+                self.ib.reqAccountUpdates(True)
                 self.ib.sleep(5)
                 for v in self.ib.accountValues():
                     if v.tag == 'NetLiquidation':
