@@ -35,7 +35,7 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME = dt_time(15, 55)
+ENTRY_TIME = dt_time(14, 0)  # TEST — restore to dt_time(15, 55)
 MARKET_CLOSE = dt_time(16, 0)
 
 # Logging
@@ -446,9 +446,9 @@ class ProductionSystem:
             if self.position_qty > 0:
                 self.check_stop_triggered()
             
-            # 3:55 PM Entry (or re-entry)
-            if now >= ENTRY_TIME and now < dt_time(15, 58):
-                if self.position_qty == 0 and self.bull_signal:
+            # Entry window
+            if now >= ENTRY_TIME and now < dt_time(14, 3):
+                if self.position_qty == 0 and not self.order_pending and self.bull_signal:
                     if self.stopped_today:
                         log.info("🔄 Re-entering after stop")
                     self.enter()
