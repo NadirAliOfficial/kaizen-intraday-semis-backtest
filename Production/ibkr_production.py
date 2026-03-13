@@ -35,8 +35,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(14, 37)  # TEST — restore to dt_time(15, 55)
-ENTRY_TIME_END = dt_time(14, 40)  # TEST — restore to dt_time(15, 58)
+ENTRY_TIME     = dt_time(14, 43)  # TEST — restore to dt_time(15, 55)
+ENTRY_TIME_END = dt_time(14, 46)  # TEST — restore to dt_time(15, 58)
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
@@ -82,6 +82,14 @@ class ProductionSystem:
                 self.ib = IB()
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
                 self.ib.reqMarketDataType(4)  # 4 = delayed frozen (works after-hours on TWS)
+
+                # Pre-subscribe to account updates so data is cached before entry fires
+                accounts = self.ib.managedAccounts()
+                self._account = accounts[0] if accounts else ''
+                if self._account:
+                    self.ib.reqAccountUpdates(True, self._account)
+                    self.ib.sleep(5)  # wait for account data to populate
+                    log.info(f"✅ Account: {self._account}")
 
                 log.info(f"✅ Connected (Port {IBKR_PORT})")
 
@@ -180,33 +188,40 @@ class ProductionSystem:
             log.error(f"Stop sync error: {e}")
     
     def get_account_value(self):
-        """Get NetLiquidation — tries all methods with retries"""
-        accounts = self.ib.managedAccounts()
-        account = accounts[0] if accounts else ''
+        """Get NetLiquidation from pre-subscribed account updates"""
+        account = getattr(self, '_account', '')
 
         for attempt in range(3):
-            # Method 1: accountSummary (fresh request)
+            # Method 1: read from cached accountValues (subscription started in connect)
             try:
-                summary = self.ib.accountSummary()
-                for v in summary:
-                    if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                for v in self.ib.accountValues():
+                    if v.tag == 'NetLiquidation' and v.account == account:
                         val = float(v.value)
                         if val > 0:
                             return val
             except:
                 pass
 
-            # Method 2: reqAccountUpdates with explicit account number
+            # Method 2: accountSummary fresh request
             try:
-                self.ib.reqAccountUpdates(True, account)
-                self.ib.sleep(4)
-                for v in self.ib.accountValues():
-                    if v.tag == 'NetLiquidation' and v.currency == 'USD':
+                summary = self.ib.accountSummary()
+                for v in summary:
+                    if v.tag == 'NetLiquidation':
                         val = float(v.value)
                         if val > 0:
-                            self.ib.reqAccountUpdates(False, account)
                             return val
-                self.ib.reqAccountUpdates(False, account)
+            except:
+                pass
+
+            # Method 3: re-subscribe and wait
+            try:
+                self.ib.reqAccountUpdates(True, account)
+                self.ib.sleep(5)
+                for v in self.ib.accountValues():
+                    if v.tag == 'NetLiquidation':
+                        val = float(v.value)
+                        if val > 0:
+                            return val
             except:
                 pass
 
