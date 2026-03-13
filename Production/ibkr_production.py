@@ -17,7 +17,7 @@ import pytz
 # CONFIGURATION
 # ============================================================================
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7497  # 4002 = PAPER, 4001 = LIVE (Gateway)
+IBKR_PORT = 4002  # 4002 = PAPER (Gateway), 4001 = LIVE (Gateway), 7497 = TWS
 CLIENT_ID = 1
 
 SYMBOL = "SMH"
@@ -35,8 +35,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(14, 48)  # TEST — restore to dt_time(15, 55)
-ENTRY_TIME_END = dt_time(14, 51)  # TEST — restore to dt_time(15, 58)
+ENTRY_TIME     = dt_time(14, 56)  # TEST — restore to dt_time(15, 55)
+ENTRY_TIME_END = dt_time(14, 59)  # TEST — restore to dt_time(15, 58)
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
