@@ -17,7 +17,7 @@ import pytz
 # CONFIGURATION
 # ============================================================================
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 4002  # 4002 = PAPER, 4001 = LIVE (Gateway)
+IBKR_PORT = 7497  # 4002 = PAPER, 4001 = LIVE (Gateway)
 CLIENT_ID = 1
 
 SYMBOL = "SMH"
@@ -35,8 +35,9 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME = dt_time(14, 0)  # TEST — restore to dt_time(15, 55)
-MARKET_CLOSE = dt_time(16, 0)
+ENTRY_TIME     = dt_time(14, 37)  # TEST — restore to dt_time(15, 55)
+ENTRY_TIME_END = dt_time(14, 40)  # TEST — restore to dt_time(15, 58)
+MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
 logging.basicConfig(
@@ -180,6 +181,9 @@ class ProductionSystem:
     
     def get_account_value(self):
         """Get NetLiquidation — tries all methods with retries"""
+        accounts = self.ib.managedAccounts()
+        account = accounts[0] if accounts else ''
+
         for attempt in range(3):
             # Method 1: accountSummary (fresh request)
             try:
@@ -192,17 +196,17 @@ class ProductionSystem:
             except:
                 pass
 
-            # Method 2: reqAccountUpdates then accountValues
+            # Method 2: reqAccountUpdates with explicit account number
             try:
-                self.ib.reqAccountUpdates(True, '')
-                self.ib.sleep(3)
+                self.ib.reqAccountUpdates(True, account)
+                self.ib.sleep(4)
                 for v in self.ib.accountValues():
                     if v.tag == 'NetLiquidation' and v.currency == 'USD':
                         val = float(v.value)
                         if val > 0:
-                            self.ib.reqAccountUpdates(False, '')
+                            self.ib.reqAccountUpdates(False, account)
                             return val
-                self.ib.reqAccountUpdates(False, '')
+                self.ib.reqAccountUpdates(False, account)
             except:
                 pass
 
@@ -447,7 +451,7 @@ class ProductionSystem:
                 self.check_stop_triggered()
             
             # Entry window
-            if now >= ENTRY_TIME and now < dt_time(14, 3):
+            if now >= ENTRY_TIME and now < ENTRY_TIME_END:
                 if self.position_qty == 0 and not self.order_pending and self.bull_signal:
                     if self.stopped_today:
                         log.info("🔄 Re-entering after stop")
