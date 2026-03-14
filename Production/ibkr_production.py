@@ -35,8 +35,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(6, 30)    # TEST — production: dt_time(15, 55)
-ENTRY_TIME_END = dt_time(6, 33)    # TEST — production: dt_time(15, 58)
+ENTRY_TIME     = dt_time(15, 55)   # PRODUCTION
+ENTRY_TIME_END = dt_time(15, 58)   # PRODUCTION
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
@@ -87,15 +87,9 @@ class ProductionSystem:
                 self.ib.connect(IBKR_HOST, IBKR_PORT, clientId=CLIENT_ID, timeout=20)
                 self.ib.reqMarketDataType(4)  # 4 = delayed frozen (works after-hours on TWS)
 
-                # Pre-subscribe to account updates so data is cached before entry fires
                 accounts = self.ib.managedAccounts()
                 self._account = accounts[0] if accounts else ''
-                if self._account:
-                    self.ib.reqAccountUpdates(True)
-                    self.ib.sleep(5)  # wait for account data to populate
-                    log.info(f"✅ Account: {self._account}")
-
-                log.info(f"✅ Connected (Port {IBKR_PORT})")
+                log.info(f"✅ Connected (Port {IBKR_PORT}) | Account: {self._account}")
 
                 self.initialize_emas()
                 self.sync_position()
@@ -159,78 +153,51 @@ class ProductionSystem:
     def sync_stops(self, has_position):
         """Synchronize stop orders with IBKR state"""
         try:
-            # Get all open orders
-            open_orders = self.ib.openOrders()
-            smh_stops = [o for o in open_orders 
-                        if o.contract.symbol == SYMBOL 
-                        and o.order.orderType == 'STP']
-            
+            # Get all open trades (Trade objects have .contract and .order)
+            open_trades = self.ib.openTrades()
+            smh_stops = [t for t in open_trades
+                        if t.contract.symbol == SYMBOL
+                        and t.order.orderType == 'STP']
+
             if has_position and len(smh_stops) == 0:
-                # Position exists but no stop - CREATE
                 log.warning("⚠️  Position without stop - creating")
                 stop_price = self.position_entry * (1 - STOP_PCT)
                 self.place_stop(self.position_qty, stop_price)
-                
+
             elif has_position and len(smh_stops) > 0:
-                # Position exists with stop - VERIFY
                 stop = smh_stops[0]
                 self.stop_order_id = stop.order.orderId
                 log.info(f"✅ Stop verified: {stop.order.auxPrice:.2f}")
-                
-                # Cancel extra stops
+
                 for extra in smh_stops[1:]:
-                    self.ib.cancelOrder(extra.order.orderId)
+                    self.ib.cancelOrder(extra.order)
                     log.warning(f"⚠️  Cancelled duplicate stop")
-                    
+
             elif not has_position and len(smh_stops) > 0:
-                # No position but stops exist - CANCEL orphans
                 for stop in smh_stops:
-                    self.ib.cancelOrder(stop.order.orderId)
+                    self.ib.cancelOrder(stop.order)
                     log.warning(f"⚠️  Cancelled orphan stop")
                     
         except Exception as e:
             log.error(f"Stop sync error: {e}")
     
     def get_account_value(self):
-        """Get NetLiquidation from pre-subscribed account updates"""
+        """Get NetLiquidation (any currency — account is EUR-denominated)"""
         account = getattr(self, '_account', '')
 
         for attempt in range(3):
-            # Method 1: read from cached accountValues (subscription started in connect)
             try:
                 for v in self.ib.accountValues():
-                    if v.tag == 'NetLiquidation' and v.account == account:
+                    if v.tag == 'NetLiquidation' and v.account == account and v.currency != 'BASE':
                         val = float(v.value)
                         if val > 0:
-                            return val
-            except:
-                pass
-
-            # Method 2: accountSummary fresh request
-            try:
-                summary = self.ib.accountSummary()
-                for v in summary:
-                    if v.tag == 'NetLiquidation':
-                        val = float(v.value)
-                        if val > 0:
-                            return val
-            except:
-                pass
-
-            # Method 3: re-subscribe and wait
-            try:
-                self.ib.reqAccountUpdates(True)
-                self.ib.sleep(5)
-                for v in self.ib.accountValues():
-                    if v.tag == 'NetLiquidation':
-                        val = float(v.value)
-                        if val > 0:
+                            log.info(f"   Equity: {v.currency} {val:,.2f}")
                             return val
             except:
                 pass
 
             log.warning(f"⚠️  Account value attempt {attempt+1} returned 0, retrying...")
-            self.ib.sleep(2)
+            self.ib.sleep(3)
 
         log.error("❌ Could not fetch account value after 3 attempts")
         return 0
@@ -295,10 +262,13 @@ class ProductionSystem:
             self._pending_trade = trade
             self.ib.sleep(2)
 
-            for _ in range(30):
-                if trade.orderStatus.status in ['Filled', 'Cancelled']:
+            for i in range(30, 0, -1):
+                if trade.orderStatus.status in ['Filled', 'Cancelled', 'Inactive']:
                     break
+                sys.stdout.write(f"\r   ⏳ Waiting for fill... {i}s | {trade.orderStatus.status}    ")
+                sys.stdout.flush()
                 self.ib.sleep(1)
+            print()  # new line after countdown
 
             status = trade.orderStatus.status
             if status == 'Filled':
@@ -509,8 +479,8 @@ class ProductionSystem:
                     log.info(f"   Pending order: YES")
                 log.info("=" * 60)
 
-            # Morning reset
-            if now < dt_time(9, 35):
+            # Morning reset (narrow window so it runs once, not all pre-market)
+            if dt_time(9, 30) <= now < dt_time(9, 35):
                 self.stopped_today = False
                 self.order_pending = False
                 self._entered_today = False
@@ -549,10 +519,9 @@ class ProductionSystem:
                         current_stop = self.position_entry * (1 - STOP_PCT)
                         if self.stop_order_id:
                             try:
-                                orders = self.ib.openOrders()
-                                for o in orders:
-                                    if o.order.orderId == self.stop_order_id:
-                                        current_stop = o.order.auxPrice
+                                for t in self.ib.openTrades():
+                                    if t.order.orderId == self.stop_order_id:
+                                        current_stop = t.order.auxPrice
                                         break
                             except:
                                 pass
@@ -586,21 +555,52 @@ class ProductionSystem:
         except Exception as e:
             log.error(f"Cycle error: {e}")
     
+    def _show_countdown(self):
+        """Show live countdown to entry on a single line"""
+        now_et = datetime.now(pytz.timezone('US/Eastern'))
+        today = now_et.date()
+
+        entry_dt = datetime.combine(today, ENTRY_TIME, tzinfo=now_et.tzinfo)
+        diff = (entry_dt - now_et).total_seconds()
+
+        if self._entered_today or self.position_qty > 0 or self.order_pending:
+            return  # no countdown needed
+
+        if diff <= 0:
+            return  # entry window passed or active
+
+        h = int(diff // 3600)
+        m = int((diff % 3600) // 60)
+        s = int(diff % 60)
+
+        if h > 0:
+            countdown = f"{h}h {m:02d}m {s:02d}s"
+        elif m > 0:
+            countdown = f"{m}m {s:02d}s"
+        else:
+            countdown = f"{s}s"
+
+        signal = "BULL" if self.bull_signal else "BEAR"
+        sys.stdout.write(f"\r   ⏳ Entry in {countdown} | {signal} | Pos: {self.position_qty}    ")
+        sys.stdout.flush()
+
     def run(self):
         """Main loop"""
         log.info("🚀 PRODUCTION STARTED")
         log.info(f"   EMA {EMA_FAST}/{EMA_SLOW} | Stop {STOP_PCT*100}%")
-        
+
         try:
             while True:
                 if not self.ib.isConnected():
                     log.warning("⚠️  Reconnecting...")
                     self.connect()
-                
+
                 self.daily_cycle()
-                time.sleep(10)
-                
+                self._show_countdown()
+                time.sleep(1)
+
         except KeyboardInterrupt:
+            print()  # clean line after \r
             log.info("⏹️  Shutdown")
             self.ib.disconnect()
         except Exception as e:
