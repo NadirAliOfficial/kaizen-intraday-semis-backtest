@@ -35,8 +35,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(15, 5)   # TEST — restore to dt_time(15, 55)
-ENTRY_TIME_END = dt_time(15, 8)   # TEST — restore to dt_time(15, 58)
+ENTRY_TIME     = dt_time(6, 30)    # TEST — production: dt_time(13, 55)
+ENTRY_TIME_END = dt_time(6, 33)    # TEST — production: dt_time(13, 58)
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Logging
@@ -70,6 +70,9 @@ class ProductionSystem:
         self.last_known_price = 0
         self.order_pending = False
         self._last_heartbeat_minute = -1
+        self._entered_today = False
+        self._close_done_today = False
+        self._pending_trade = None  # track MOC trade for fill checking
         
         self.connect()
     
@@ -238,6 +241,7 @@ class ProductionSystem:
             ticker = self.ib.reqMktData(self.vix)
             self.ib.sleep(2)
             vix = ticker.last if ticker.last == ticker.last else ticker.close
+            self.ib.cancelMktData(self.vix)
             return vix if vix > 0 else 15.0
         except:
             return 15.0
@@ -272,40 +276,50 @@ class ProductionSystem:
         if prev != self.bull_signal:
             log.info(f"📊 SIGNAL: {'BULL' if self.bull_signal else 'BEAR'}")
     
-    def place_moc(self, action, qty):
-        """Market-On-Close order"""
+    def place_order(self, action, qty):
+        """Place MOC order (falls back to MKT if past 15:45 ET)"""
         try:
+            now_et = datetime.now(pytz.timezone('US/Eastern')).time()
             order = Order()
             order.action = action
             order.totalQuantity = abs(qty)
-            order.orderType = "MOC"
             order.tif = "DAY"
-            
+
+            if now_et >= dt_time(15, 45):
+                order.orderType = "MKT"
+                log.info(f"📨 Using MKT order (past 15:45 ET)")
+            else:
+                order.orderType = "MOC"
+
             trade = self.ib.placeOrder(self.smh, order)
+            self._pending_trade = trade
             self.ib.sleep(2)
-            
+
             for _ in range(30):
                 if trade.orderStatus.status in ['Filled', 'Cancelled']:
                     break
                 self.ib.sleep(1)
-            
+
             status = trade.orderStatus.status
             if status == 'Filled':
                 fill = trade.orderStatus.avgFillPrice
                 log.info(f"✅ {action} {qty} @ ${fill:.2f}")
+                self._pending_trade = None
                 return fill
             elif status in ('PreSubmitted', 'Submitted'):
-                log.info(f"📨 Order submitted — {action} {qty} MOC | awaiting fill at market close")
+                log.info(f"📨 Order submitted — {action} {qty} {order.orderType} | awaiting fill")
                 return -1  # signals order is live, not yet filled
             else:
                 log.error(f"❌ Order rejected — status: {status}")
                 for entry in trade.log:
                     if entry.errorCode:
                         log.error(f"   IBKR error {entry.errorCode}: {entry.message}")
+                self._pending_trade = None
                 return None
-                
+
         except Exception as e:
             log.error(f"Order error: {e}")
+            self._pending_trade = None
             return None
     
     def place_stop(self, qty, stop_price):
@@ -357,49 +371,81 @@ class ProductionSystem:
         
         return False
     
+    def check_pending_fill(self):
+        """Check if a pending MOC/MKT order has filled"""
+        if not self._pending_trade:
+            return
+        trade = self._pending_trade
+        status = trade.orderStatus.status
+        if status == 'Filled':
+            fill = trade.orderStatus.avgFillPrice
+            qty = int(trade.order.totalQuantity)
+            action = trade.order.action
+            log.info(f"✅ Pending fill: {action} {qty} @ ${fill:.2f}")
+            self._pending_trade = None
+            self.order_pending = False
+
+            if action == 'BUY':
+                self.position_qty = qty
+                self.position_entry = fill
+                stop_price = fill * (1 - STOP_PCT)
+                self.place_stop(qty, stop_price)
+                log.info(f"✅ OPENED: {qty} @ ${fill:.2f}")
+            elif action == 'SELL':
+                if self.position_qty > 0:
+                    pnl = self.position_qty * (fill - self.position_entry)
+                    pct = (fill / self.position_entry - 1) * 100 if self.position_entry > 0 else 0
+                    log.info(f"✅ CLOSED: {self.position_qty} @ ${fill:.2f} | ${pnl:,.0f} ({pct:+.2f}%)")
+                self.position_qty = 0
+                self.position_entry = 0
+        elif status in ('Cancelled', 'Inactive'):
+            log.error(f"❌ Pending order {status}")
+            self._pending_trade = None
+            self.order_pending = False
+
     def enter(self):
-        """Entry at 3:55 PM"""
-        if self.order_pending:
+        """Entry"""
+        if self.order_pending or self._entered_today:
             return
         try:
             equity = self.get_account_value()
             leverage = self.get_leverage()
-            
+
             ticker = self.ib.reqMktData(self.smh)
             self.ib.sleep(2)
             price = ticker.last if ticker.last == ticker.last else ticker.close
             price = price if price == price else None  # NaN guard
             if not price or price <= 0:
-                price = self.last_known_price  # fallback to last historical close
+                price = self.last_known_price
                 log.warning(f"⚠️  Live price unavailable, using last close: ${price:.2f}")
 
             if not price or price <= 0:
                 log.error("❌ No price available, skipping entry")
                 return
-            
+
             qty = int((equity * leverage) / price)
-            
+
             if qty <= 0:
-                log.error("❌ Invalid qty")
+                log.error("❌ Invalid qty (equity=${equity:.0f})")
                 return
-            
-            log.info(f"📊 Entry: ${equity:,.0f} × {leverage}x = {qty} shares")
-            
-            fill = self.place_moc("BUY", qty)
+
+            log.info(f"📊 Entry: ${equity:,.0f} × {leverage}x = {qty} shares @ ~${price:.2f}")
+
+            fill = self.place_order("BUY", qty)
+            self._entered_today = True  # prevent repeated entries
 
             if fill == -1:
-                self.order_pending = True  # submitted, waiting for MOC fill
+                self.order_pending = True
             elif fill and fill > 0:
                 self.order_pending = False
                 self.position_qty = qty
                 self.position_entry = fill
-                
-                # Stop at 1.9% below entry
+
                 stop_price = fill * (1 - STOP_PCT)
                 self.place_stop(qty, stop_price)
-                
+
                 log.info(f"✅ OPENED: {qty} @ ${fill:.2f}")
-            
+
         except Exception as e:
             log.error(f"Entry error: {e}")
     
@@ -407,33 +453,38 @@ class ProductionSystem:
         """Exit position"""
         if self.position_qty == 0:
             return
-        
+
         try:
             log.info(f"🚪 Exit: {reason}")
-            
+
             self.cancel_stop()
-            
-            fill = self.place_moc("SELL", self.position_qty)
-            
-            if fill:
+
+            fill = self.place_order("SELL", self.position_qty)
+
+            if fill and fill > 0:
                 pnl = self.position_qty * (fill - self.position_entry)
                 pct = (fill / self.position_entry - 1) * 100
-                
+
                 log.info(f"✅ CLOSED: {self.position_qty} @ ${fill:.2f} | ${pnl:,.0f} ({pct:+.2f}%)")
-                
+
                 self.position_qty = 0
                 self.position_entry = 0
-            
+            elif fill == -1:
+                self.order_pending = True
+
         except Exception as e:
             log.error(f"Exit error: {e}")
     
     def daily_cycle(self):
         """Main loop"""
         try:
-            now = datetime.now(pytz.timezone('US/Eastern')).time()
-            
-            # HEARTBEAT LOGGING (every 5 minutes, 24/7)
             now_et = datetime.now(pytz.timezone('US/Eastern'))
+            now = now_et.time()
+
+            # Check pending order fills
+            self.check_pending_fill()
+
+            # HEARTBEAT LOGGING (every 5 minutes, 24/7)
             current_minute = now_et.minute
             if current_minute % 5 == 0 and current_minute != self._last_heartbeat_minute:
                 self._last_heartbeat_minute = current_minute
@@ -441,8 +492,7 @@ class ProductionSystem:
                     ticker = self.ib.reqMktData(self.smh)
                     self.ib.sleep(2)
                     raw = ticker.last if ticker.last == ticker.last else ticker.close
-                    price = raw if (raw == raw and raw > 0) else None  # filter NaN
-                    self.ib.cancelMktData(self.smh)
+                    price = raw if (raw == raw and raw > 0) else None
                 except:
                     price = None
 
@@ -455,43 +505,47 @@ class ProductionSystem:
                 log.info(f"   Position: {self.position_qty} shares")
                 if self.position_qty > 0:
                     log.info(f"   Entry: ${self.position_entry:.2f}")
+                if self.order_pending:
+                    log.info(f"   Pending order: YES")
                 log.info("=" * 60)
-            
+
             # Morning reset
             if now < dt_time(9, 35):
                 self.stopped_today = False
                 self.order_pending = False
-            
+                self._entered_today = False
+                self._close_done_today = False
+
             # Check stop
             if self.position_qty > 0:
                 self.check_stop_triggered()
-            
-            # Entry window
+
+            # Entry window (runs ONCE per day)
             if now >= ENTRY_TIME and now < ENTRY_TIME_END:
-                if self.position_qty == 0 and not self.order_pending and self.bull_signal:
+                if self.position_qty == 0 and not self.order_pending and not self._entered_today and self.bull_signal:
                     if self.stopped_today:
                         log.info("🔄 Re-entering after stop")
                     self.enter()
-            
-            # 4:00 PM Update & Exit
-            if now >= MARKET_CLOSE and now < dt_time(16, 5):
+
+            # 4:00 PM Update & Exit (runs ONCE per day)
+            if now >= MARKET_CLOSE and now < dt_time(16, 5) and not self._close_done_today:
+                self._close_done_today = True
                 ticker = self.ib.reqMktData(self.smh)
                 self.ib.sleep(2)
                 close = ticker.close
-                
+
                 if close and close > 0:
                     self.update_emas(close)
-                    
+
                     # Bear exit
                     if self.position_qty > 0 and not self.bull_signal:
                         self.exit("BEAR")
-                    
+
                     # If still in position
                     elif self.position_qty > 0 and self.bull_signal:
-                        # 1. TRAILING STOP (independent, price-based)
+                        # 1. TRAILING STOP
                         new_stop = close * (1 - STOP_PCT)
-                        
-                        # Get current stop price
+
                         current_stop = self.position_entry * (1 - STOP_PCT)
                         if self.stop_order_id:
                             try:
@@ -502,35 +556,33 @@ class ProductionSystem:
                                         break
                             except:
                                 pass
-                        
-                        # Move stop UP only
+
                         if new_stop > current_stop:
                             log.info(f"📈 Trailing stop: ${current_stop:.2f} → ${new_stop:.2f}")
                             self.cancel_stop()
                             self.place_stop(self.position_qty, new_stop)
-                        
-                        # 2. REBALANCING (independent of stop)
+
+                        # 2. REBALANCING (only if >2% drift)
                         equity = self.get_account_value()
                         leverage = self.get_leverage()
                         target_notional = equity * leverage
                         target_qty = int(target_notional / close)
-                        
+
                         current_notional = self.position_qty * close
-                        notional_diff = abs(target_notional - current_notional)
-                        
-                        if notional_diff > 50:
+                        drift_pct = abs(target_notional - current_notional) / current_notional if current_notional > 0 else 0
+
+                        if drift_pct > 0.02:  # 2% threshold
                             qty_diff = target_qty - self.position_qty
-                            
+
                             if qty_diff > 0:
-                                log.info(f"📊 Rebalance UP: +{qty_diff} shares")
-                                self.place_moc("BUY", qty_diff)
+                                log.info(f"📊 Rebalance UP: +{qty_diff} shares ({drift_pct:.1%} drift)")
+                                self.place_order("BUY", qty_diff)
                             elif qty_diff < 0:
-                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares")
-                                self.place_moc("SELL", abs(qty_diff))
-                            
+                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares ({drift_pct:.1%} drift)")
+                                self.place_order("SELL", abs(qty_diff))
+
                             self.position_qty = target_qty
-                            # Stop remains unchanged (trailing handled above)
-            
+
         except Exception as e:
             log.error(f"Cycle error: {e}")
     
