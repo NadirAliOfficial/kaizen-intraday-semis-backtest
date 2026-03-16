@@ -597,16 +597,16 @@ class ProductionSystem:
                         target_qty = int(target_notional / close)
 
                         current_notional = self.position_qty * close
-                        drift_pct = abs(target_notional - current_notional) / current_notional if current_notional > 0 else 0
+                        notional_diff = abs(target_notional - current_notional)
 
-                        if drift_pct > 0.02:  # 2% threshold
+                        if notional_diff > 50:  # rebalance if >$50 difference
                             qty_diff = target_qty - self.position_qty
 
                             if qty_diff > 0:
-                                log.info(f"📊 Rebalance UP: +{qty_diff} shares ({drift_pct:.1%} drift)")
+                                log.info(f"📊 Rebalance UP: +{qty_diff} shares (${notional_diff:,.0f} drift)")
                                 self.place_order("BUY", qty_diff)
                             elif qty_diff < 0:
-                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares ({drift_pct:.1%} drift)")
+                                log.info(f"📊 Rebalance DOWN: {qty_diff} shares (${notional_diff:,.0f} drift)")
                                 self.place_order("SELL", abs(qty_diff))
 
                             self.position_qty = target_qty
