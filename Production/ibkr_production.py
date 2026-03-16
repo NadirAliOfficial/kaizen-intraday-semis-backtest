@@ -7,6 +7,7 @@ Version: 2.0 FINAL
 import sys
 import io
 import os
+import re
 import time
 import logging
 import requests
@@ -40,12 +41,16 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(22, 21)   # TEST — production: dt_time(15, 55)
-ENTRY_TIME_END = dt_time(22, 24)   # TEST — production: dt_time(15, 58)
+ENTRY_TIME     = dt_time(22, 27)   # TEST — production: dt_time(15, 55)
+ENTRY_TIME_END = dt_time(22, 30)   # TEST — production: dt_time(15, 58)
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Telegram Alerts
 TG_TOKEN = os.getenv("TG_TOKEN", "")
+
+def _strip_html(text):
+    """Remove HTML tags from IBKR error messages"""
+    return re.sub(r'<[^>]+>', ' ', text).strip()
 
 def tg(msg):
     """Send Telegram alert — auto-fetches chat_id from latest bot update"""
@@ -59,7 +64,7 @@ def tg(msg):
         chat_id = data["result"][-1]["message"]["chat"]["id"]
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": _strip_html(msg), "parse_mode": ""},
             timeout=5
         )
     except:
