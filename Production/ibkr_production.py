@@ -22,7 +22,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 # CONFIGURATION
 # ============================================================================
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7497  # 7497 = TWS PAPER, 7496 = TWS LIVE, 4002 = Gateway PAPER
+IBKR_PORT = 4002  # 4002 = Gateway PAPER, 4001 = Gateway LIVE
 CLIENT_ID = 10
 
 SYMBOL = "SMH"
@@ -45,28 +45,21 @@ ENTRY_TIME_END = dt_time(15, 58)   # PRODUCTION
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Telegram Alerts
-TG_TOKEN   = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = None  # auto-detected on startup
+TG_TOKEN = os.getenv("TG_TOKEN", "")
 
-def _tg_get_chat_id():
-    """Auto-detect chat ID from last message sent to bot"""
+def tg(msg):
+    """Send Telegram alert — auto-fetches chat_id from latest bot update"""
+    if not TG_TOKEN:
+        return
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=5)
         data = r.json()
-        if data.get("result"):
-            return data["result"][-1]["message"]["chat"]["id"]
-    except:
-        pass
-    return None
-
-def tg(msg):
-    """Send Telegram alert"""
-    if not TG_CHAT_ID:
-        return
-    try:
+        if not data.get("result"):
+            return
+        chat_id = data["result"][-1]["message"]["chat"]["id"]
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
             timeout=5
         )
     except:
@@ -642,8 +635,8 @@ class ProductionSystem:
             countdown = f"{s}s"
 
         signal = "BULL" if self.bull_signal else "BEAR"
-        sys.stdout.write(f"\r   ⏳ Entry in {countdown} | {signal} | Pos: {self.position_qty}    ")
-        sys.stdout.flush()
+        sys.stderr.write(f"\r   ⏳ Entry in {countdown} | {signal} | Pos: {self.position_qty}    ")
+        sys.stderr.flush()
 
     def run(self):
         """Main loop"""
@@ -677,13 +670,11 @@ if __name__ == "__main__":
     log.info(f"Port: {IBKR_PORT} ({'LIVE' if IBKR_PORT == 4001 else 'PAPER'})")
     log.info("=" * 80)
 
-    # Auto-detect Telegram chat ID
-    TG_CHAT_ID = _tg_get_chat_id()
-    if TG_CHAT_ID:
-        log.info(f"✅ Telegram alerts active (chat_id: {TG_CHAT_ID})")
+    if TG_TOKEN:
+        log.info("✅ Telegram alerts active")
         tg("🟢 <b>Bot Started</b>\nSMH production system is live.\nEntry: 15:55 ET | Stop: 1.9%")
     else:
-        log.warning("⚠️  Telegram: no chat_id found — send any message to your bot first")
+        log.warning("⚠️  Telegram: TG_TOKEN not set in .env")
 
     system = ProductionSystem()
     system.run()
