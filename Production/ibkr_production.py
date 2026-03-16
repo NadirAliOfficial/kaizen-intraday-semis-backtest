@@ -41,8 +41,8 @@ LEV_VIX_13 = 3.5
 LEV_VIX_12 = 3.75
 
 # Trading Times (ET)
-ENTRY_TIME     = dt_time(22, 27)   # TEST — production: dt_time(15, 55)
-ENTRY_TIME_END = dt_time(22, 30)   # TEST — production: dt_time(15, 58)
+ENTRY_TIME     = dt_time(15, 55)   # PRODUCTION
+ENTRY_TIME_END = dt_time(15, 58)   # PRODUCTION
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Telegram Alerts
