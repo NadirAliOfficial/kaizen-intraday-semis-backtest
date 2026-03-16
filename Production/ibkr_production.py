@@ -640,8 +640,9 @@ class ProductionSystem:
             countdown = f"{s}s"
 
         signal = "BULL" if self.bull_signal else "BEAR"
-        sys.stderr.write(f"\r   ⏳ Entry in {countdown} | {signal} | Pos: {self.position_qty}    ")
-        sys.stderr.flush()
+        line = f"\r   ⏳ Entry in {countdown} | {signal} | Pos: {self.position_qty}    "
+        sys.stdout.buffer.write(line.encode('utf-8'))
+        sys.stdout.buffer.flush()
 
     def run(self):
         """Main loop"""
