@@ -6,13 +6,17 @@ Version: 2.0 FINAL
 """
 import sys
 import io
+import os
 import time
 import logging
 import requests
 from datetime import datetime, time as dt_time
+from dotenv import load_dotenv
 from ib_insync import IB, Stock, Order, util, Index
 import pandas as pd
 import pytz
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 # ============================================================================
 # CONFIGURATION
@@ -41,7 +45,7 @@ ENTRY_TIME_END = dt_time(15, 58)   # PRODUCTION
 MARKET_CLOSE   = dt_time(16, 0)
 
 # Telegram Alerts
-TG_TOKEN   = "7759437574:AAF2CWnfck8C_xulK87ehD-EjX1cWeaVy3M"
+TG_TOKEN   = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID = None  # auto-detected on startup
 
 def _tg_get_chat_id():
