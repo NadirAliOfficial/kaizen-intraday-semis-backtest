@@ -615,18 +615,24 @@ class ProductionSystem:
             log.error(f"Cycle error: {e}")
     
     def _show_countdown(self):
-        """Show live countdown to entry on a single line"""
+        """Show live countdown to next entry on a single line"""
+        from datetime import timedelta
         now_et = datetime.now(pytz.timezone('US/Eastern'))
-        today = now_et.date()
 
-        entry_dt = datetime.combine(today, ENTRY_TIME, tzinfo=now_et.tzinfo)
+        entry_dt = datetime.combine(now_et.date(), ENTRY_TIME, tzinfo=now_et.tzinfo)
+        if entry_dt <= now_et:
+            # Today's window passed — show countdown to next weekday
+            days_ahead = 1
+            next_day = now_et.date() + timedelta(days=days_ahead)
+            while next_day.weekday() >= 5:  # skip Saturday(5) and Sunday(6)
+                days_ahead += 1
+                next_day = now_et.date() + timedelta(days=days_ahead)
+            entry_dt = datetime.combine(next_day, ENTRY_TIME, tzinfo=now_et.tzinfo)
+
         diff = (entry_dt - now_et).total_seconds()
 
         if self._entered_today or self.position_qty > 0 or self.order_pending:
-            return  # no countdown needed
-
-        if diff <= 0:
-            return  # entry window passed or active
+            return
 
         h = int(diff // 3600)
         m = int((diff % 3600) // 60)
