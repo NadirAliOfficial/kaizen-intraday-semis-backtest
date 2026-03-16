@@ -8,6 +8,7 @@ import sys
 import io
 import time
 import logging
+import requests
 from datetime import datetime, time as dt_time
 from ib_insync import IB, Stock, Order, util, Index
 import pandas as pd
@@ -38,6 +39,34 @@ LEV_VIX_12 = 3.75
 ENTRY_TIME     = dt_time(15, 55)   # PRODUCTION
 ENTRY_TIME_END = dt_time(15, 58)   # PRODUCTION
 MARKET_CLOSE   = dt_time(16, 0)
+
+# Telegram Alerts
+TG_TOKEN   = "7759437574:AAF2CWnfck8C_xulK87ehD-EjX1cWeaVy3M"
+TG_CHAT_ID = None  # auto-detected on startup
+
+def _tg_get_chat_id():
+    """Auto-detect chat ID from last message sent to bot"""
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=5)
+        data = r.json()
+        if data.get("result"):
+            return data["result"][-1]["message"]["chat"]["id"]
+    except:
+        pass
+    return None
+
+def tg(msg):
+    """Send Telegram alert"""
+    if not TG_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=5
+        )
+    except:
+        pass
 
 # Logging
 logging.basicConfig(
@@ -90,6 +119,7 @@ class ProductionSystem:
                 accounts = self.ib.managedAccounts()
                 self._account = accounts[0] if accounts else ''
                 log.info(f"✅ Connected (Port {IBKR_PORT}) | Account: {self._account}")
+                tg(f"✅ <b>Connected</b> to IBKR (Port {IBKR_PORT})\nAccount: {self._account}")
 
                 self.initialize_emas()
                 self.sync_position()
@@ -99,6 +129,8 @@ class ProductionSystem:
             except Exception as e:
                 delay = 10 if attempt % 2 == 0 else 15
                 log.error(f"Connect failed (attempt {attempt}): {e} — retrying in {delay}s...")
+                if attempt == 1:
+                    tg(f"🔴 <b>Disconnected</b>\nCannot connect to IBKR. Retrying every {delay}s...\nError: {e}")
                 time.sleep(delay)
     
     def initialize_emas(self):
@@ -274,13 +306,18 @@ class ProductionSystem:
             if status == 'Filled':
                 fill = trade.orderStatus.avgFillPrice
                 log.info(f"✅ {action} {qty} @ ${fill:.2f}")
+                tg(f"✅ <b>Order Filled</b>\n{action} {qty} SMH @ ${fill:.2f}")
                 self._pending_trade = None
                 return fill
             elif status in ('PreSubmitted', 'Submitted'):
                 log.info(f"📨 Order submitted — {action} {qty} {order.orderType} | awaiting fill")
+                tg(f"📨 <b>Order Submitted</b>\n{action} {qty} SMH ({order.orderType})\nAwaiting fill at market close")
                 return -1  # signals order is live, not yet filled
             else:
                 log.error(f"❌ Order rejected — status: {status}")
+                err_msgs = [f"{e.errorCode}: {e.message}" for e in trade.log if e.errorCode]
+                err_str = "\n".join(err_msgs) if err_msgs else status
+                tg(f"🚫 <b>Order Rejected</b>\n{action} {qty} SMH\n{err_str}")
                 for entry in trade.log:
                     if entry.errorCode:
                         log.error(f"   IBKR error {entry.errorCode}: {entry.message}")
@@ -466,9 +503,10 @@ class ProductionSystem:
                 except:
                     price = None
 
+                price_str = f"${price:.2f}" if price is not None else "No data"
                 log.info("=" * 60)
                 log.info(f"💓 HEARTBEAT | {now_et.strftime('%Y-%m-%d %H:%M:%S ET')}")
-                log.info(f"   SMH Price: ${price:.2f}" if price is not None else "   SMH Price: No data")
+                log.info(f"   SMH Price: {price_str}")
                 log.info(f"   EMA 25: {self.ema_25:.2f}")
                 log.info(f"   EMA 125: {self.ema_125:.2f}")
                 log.info(f"   Signal: {'BULL ✅' if self.bull_signal else 'BEAR ❌'}")
@@ -478,6 +516,25 @@ class ProductionSystem:
                 if self.order_pending:
                     log.info(f"   Pending order: YES")
                 log.info("=" * 60)
+
+                # Telegram 5-min heartbeat
+                now_et_str = now_et.strftime('%H:%M ET')
+                entry_dt = datetime.combine(now_et.date(), ENTRY_TIME, tzinfo=now_et.tzinfo)
+                diff = (entry_dt - now_et).total_seconds()
+                if diff > 0:
+                    h, rem = divmod(int(diff), 3600)
+                    m, s = divmod(rem, 60)
+                    next_trade = f"{h}h {m:02d}m" if h > 0 else f"{m}m {s:02d}s"
+                else:
+                    next_trade = "In window / passed"
+                signal_icon = "🐂 BULL" if self.bull_signal else "🐻 BEAR"
+                pos_str = f"{self.position_qty} shares @ ${self.position_entry:.2f}" if self.position_qty > 0 else "No position"
+                tg(
+                    f"💓 <b>Heartbeat</b> | {now_et_str}\n"
+                    f"SMH: {price_str} | {signal_icon}\n"
+                    f"Position: {pos_str}\n"
+                    f"Next entry: {next_trade}"
+                )
 
             # Morning reset (narrow window so it runs once, not all pre-market)
             if dt_time(9, 30) <= now < dt_time(9, 35):
@@ -615,6 +672,14 @@ if __name__ == "__main__":
     log.info("PRODUCTION SYSTEM - FINAL")
     log.info(f"Port: {IBKR_PORT} ({'LIVE' if IBKR_PORT == 4001 else 'PAPER'})")
     log.info("=" * 80)
-    
+
+    # Auto-detect Telegram chat ID
+    TG_CHAT_ID = _tg_get_chat_id()
+    if TG_CHAT_ID:
+        log.info(f"✅ Telegram alerts active (chat_id: {TG_CHAT_ID})")
+        tg("🟢 <b>Bot Started</b>\nSMH production system is live.\nEntry: 15:55 ET | Stop: 1.9%")
+    else:
+        log.warning("⚠️  Telegram: no chat_id found — send any message to your bot first")
+
     system = ProductionSystem()
     system.run()
