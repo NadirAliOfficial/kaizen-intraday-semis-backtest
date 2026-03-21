@@ -360,24 +360,40 @@ class ProductionSystem:
                 pass
     
     def check_stop_triggered(self):
-        """Check if IBKR stop hit"""
+        """Check if IBKR stop hit — handles full and partial exits"""
         if not self.stop_order_id:
             return False
-        
+
         try:
             positions = self.ib.positions()
-            has_pos = any(p.contract.symbol == SYMBOL for p in positions)
-            
-            if not has_pos and self.position_qty > 0:
-                log.warning("🛑 Stop triggered")
+            pos = next((p for p in positions if p.contract.symbol == SYMBOL), None)
+            actual_qty = int(pos.position) if pos else 0
+
+            if actual_qty == 0 and self.position_qty > 0:
+                # Full stop — position completely closed
+                log.warning("🛑 Stop triggered — full exit")
+                tg(f"🛑 Stop triggered — sold all {self.position_qty} shares")
                 self.position_qty = 0
                 self.position_entry = 0
                 self.stop_order_id = None
                 self.stopped_today = True
                 return True
-        except:
-            pass
-        
+
+            if 0 < actual_qty < self.position_qty:
+                # Partial stop — force-close remaining shares with MKT order
+                remaining = actual_qty
+                log.warning(f"🛑 Partial stop! Expected 0, still have {remaining} shares — force closing")
+                tg(f"🛑 Partial stop detected! {remaining} shares remaining — force closing with MKT order")
+                self.cancel_stop()
+                self.place_order("SELL", remaining)
+                self.position_qty = 0
+                self.position_entry = 0
+                self.stop_order_id = None
+                self.stopped_today = True
+                return True
+        except Exception as e:
+            log.error(f"Error checking stop: {e}")
+
         return False
     
     def check_pending_fill(self):
@@ -590,7 +606,7 @@ class ProductionSystem:
                             self.cancel_stop()
                             self.place_stop(self.position_qty, new_stop)
 
-                        # 2. REBALANCING (only if >2% drift)
+                        # 2. REBALANCING (if >$50 drift)
                         equity = self.get_account_value()
                         leverage = self.get_leverage()
                         target_notional = equity * leverage
@@ -599,17 +615,32 @@ class ProductionSystem:
                         current_notional = self.position_qty * close
                         notional_diff = abs(target_notional - current_notional)
 
-                        if notional_diff > 50:  # rebalance if >$50 difference
+                        if notional_diff > 50:
                             qty_diff = target_qty - self.position_qty
+                            fill = None
 
                             if qty_diff > 0:
                                 log.info(f"📊 Rebalance UP: +{qty_diff} shares (${notional_diff:,.0f} drift)")
-                                self.place_order("BUY", qty_diff)
+                                fill = self.place_order("BUY", qty_diff)
                             elif qty_diff < 0:
                                 log.info(f"📊 Rebalance DOWN: {qty_diff} shares (${notional_diff:,.0f} drift)")
-                                self.place_order("SELL", abs(qty_diff))
+                                fill = self.place_order("SELL", abs(qty_diff))
 
-                            self.position_qty = target_qty
+                            # Update position and resync stop ONLY after fill
+                            if fill and fill > 0:
+                                self.position_qty = target_qty
+                                # Cancel old stop and place new one with correct qty
+                                self.cancel_stop()
+                                self.place_stop(self.position_qty, new_stop)
+                                log.info(f"🛡️  Stop resynced for {self.position_qty} shares @ ${new_stop:.2f}")
+                                tg(f"📊 Rebalanced to {self.position_qty} shares\n🛡️ Stop resynced @ ${new_stop:.2f}")
+                            elif fill == -1:
+                                # MOC submitted but not filled yet — update qty, resync stop
+                                self.position_qty = target_qty
+                                self.cancel_stop()
+                                self.place_stop(self.position_qty, new_stop)
+                                log.info(f"🛡️  Stop resynced for {self.position_qty} shares (pending rebalance)")
+                                self.order_pending = True
 
         except Exception as e:
             log.error(f"Cycle error: {e}")
