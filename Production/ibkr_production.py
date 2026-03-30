@@ -350,14 +350,19 @@ class ProductionSystem:
             log.error(f"Stop error: {e}")
     
     def cancel_stop(self):
-        """Cancel stop"""
-        if self.stop_order_id:
-            try:
-                self.ib.cancelOrder(self.stop_order_id)
-                self.stop_order_id = None
-                log.info("🛡️  Stop cancelled")
-            except:
-                pass
+        """Cancel stop by finding the matching trade"""
+        if not self.stop_order_id:
+            return
+        try:
+            for t in self.ib.openTrades():
+                if t.order.orderId == self.stop_order_id:
+                    self.ib.cancelOrder(t.order)
+                    log.info("🛡️  Stop cancelled")
+                    break
+            self.stop_order_id = None
+        except Exception as e:
+            log.error(f"Cancel stop error: {e}")
+            self.stop_order_id = None
     
     def check_stop_triggered(self):
         """Check if IBKR stop hit — handles full and partial exits"""
@@ -564,6 +569,21 @@ class ProductionSystem:
             # Check stop
             if self.position_qty > 0:
                 self.check_stop_triggered()
+
+            # SAFETY: ensure stop always exists when position is open
+            if self.position_qty > 0 and not self.stop_order_id and not self.stopped_today:
+                # Verify no stop exists in IBKR before placing
+                open_trades = self.ib.openTrades()
+                smh_stops = [t for t in open_trades
+                            if t.contract.symbol == SYMBOL and t.order.orderType == 'STP']
+                if smh_stops:
+                    self.stop_order_id = smh_stops[0].order.orderId
+                    log.warning(f"⚠️  Stop found in IBKR but not tracked — resynced (orderId {self.stop_order_id})")
+                else:
+                    stop_price = self.last_known_price * (1 - STOP_PCT) if self.last_known_price > 0 else self.position_entry * (1 - STOP_PCT)
+                    log.warning(f"🚨 POSITION WITHOUT STOP — placing emergency stop @ ${stop_price:.2f}")
+                    tg(f"🚨 CRITICAL: Position without stop!\nPlacing emergency stop for {self.position_qty} shares @ ${stop_price:.2f}")
+                    self.place_stop(self.position_qty, stop_price)
 
             # Entry window (runs ONCE per day)
             if now >= ENTRY_TIME and now < ENTRY_TIME_END:
