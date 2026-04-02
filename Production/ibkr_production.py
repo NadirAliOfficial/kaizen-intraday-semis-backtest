@@ -706,11 +706,18 @@ class ProductionSystem:
         log.info("🚀 PRODUCTION STARTED")
         log.info(f"   EMA {EMA_FAST}/{EMA_SLOW} | Stop {STOP_PCT*100}%")
 
+        self._was_connected = True
+
         try:
             while True:
                 if not self.ib.isConnected():
-                    log.warning("⚠️  Reconnecting...")
+                    if self._was_connected:
+                        log.warning("🔴 IBKR connection lost!")
+                        tg("🔴 IBKR connection lost!\nBot is attempting to reconnect automatically...")
+                        self._was_connected = False
                     self.connect()
+                    self._was_connected = True
+                    tg("🟢 IBKR reconnected successfully!\nBot is operational again.")
 
                 self.daily_cycle()
                 self._show_countdown()
