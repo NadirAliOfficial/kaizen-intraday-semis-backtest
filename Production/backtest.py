@@ -59,22 +59,22 @@ for i in range(start_idx, len(df)):
     date = df.index[i]
     if pd.isna(smh_close.iloc[i]) or pd.isna(vix_close.iloc[i]):
         continue
-    
+
     stopped_today = False
-    
+
     # INTRADAY STOP CHECK (using LOW as proxy)
     if position['shares'] > 0:
         worst_price = smh_low.iloc[i]
         worst_equity = position['entry_equity'] + position['shares'] * (worst_price - position['entry'])
         dd = (worst_equity - position['entry_equity']) / position['entry_equity']
-        
+
         effective_stop = STOP_LOSS_PCT + STOP_BUFFER
-        
+
         if dd <= -effective_stop:
             # Exit at capped loss
             pnl = -(position['entry_equity'] * STOP_LOSS_PCT)
             equity = position['entry_equity'] + pnl
-            
+
             trades.append({
                 'date': date,
                 'action': 'STOP',
@@ -84,16 +84,16 @@ for i in range(start_idx, len(df)):
                 'pnl': pnl,
                 'equity': equity
             })
-            
+
             position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
             stop_count += 1
             stopped_today = True
-    
+
     # BEAR EXIT (at close)
     if position['shares'] > 0 and not bull.iloc[i] and not stopped_today:
         pnl = position['shares'] * (smh_close.iloc[i] - position['entry'])
         equity = position['entry_equity'] + pnl
-        
+
         trades.append({
             'date': date,
             'action': 'BEAR_EXIT',
@@ -103,24 +103,24 @@ for i in range(start_idx, len(df)):
             'pnl': pnl,
             'equity': equity
         })
-        
+
         position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
         bear_exit_count += 1
-    
+
     # ENTRY (includes re-entry after intraday stop)
     if position['shares'] == 0 and bull.iloc[i]:
         vix = vix_close.iloc[i]
         leverage = get_leverage(vix)
-        
+
         entry_price = smh_close.iloc[i]
         shares = (equity * leverage) / entry_price
-        
+
         position = {
             'shares': shares,
             'entry': entry_price,
             'entry_equity': equity
         }
-        
+
         trades.append({
             'date': date,
             'action': 'RE_ENTER' if stopped_today else 'ENTER',
@@ -130,24 +130,24 @@ for i in range(start_idx, len(df)):
             'vix': vix,
             'equity': equity
         })
-        
+
         entry_count += 1
-    
+
     # REBALANCING (at close, if position exists and bull)
     elif position['shares'] > 0 and bull.iloc[i]:
         close = smh_close.iloc[i]
         vix = vix_close.iloc[i]
         leverage = get_leverage(vix)
-        
+
         target_notional = equity * leverage
         target_qty = int(target_notional / close)
-        
+
         current_notional = position['shares'] * close
         notional_diff = abs(target_notional - current_notional)
-        
+
         if notional_diff > REBALANCE_THRESHOLD:
             qty_diff = target_qty - position['shares']
-            
+
             trades.append({
                 'date': date,
                 'action': 'REBALANCE',
@@ -157,16 +157,16 @@ for i in range(start_idx, len(df)):
                 'qty_diff': qty_diff,
                 'notional_diff': notional_diff
             })
-            
+
             position['shares'] = target_qty
             rebalance_count += 1
-    
+
     # EOD EQUITY
     if position['shares'] > 0:
         eod_equity = equity + position['shares'] * (smh_close.iloc[i] - position['entry'])
     else:
         eod_equity = equity
-    
+
     equity_series.append(eod_equity)
     dates_list.append(date)
 
@@ -192,10 +192,10 @@ for i, e in enumerate(equity_array):
     if e > peak:
         peak = e
         peak_date = dates_array[i]
-    
+
     dd = peak - e
     dd_pct = (dd / peak) * 100
-    
+
     if dd > max_dd_abs:
         max_dd_abs = dd
         max_dd_pct = dd_pct
