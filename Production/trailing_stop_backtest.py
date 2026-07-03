@@ -42,15 +42,15 @@ for i in range(125, len(df)):
     date = df.index[i]
     if pd.isna(smh_close.iloc[i]) or pd.isna(vix_close.iloc[i]):
         continue
-    
+
     # STOP CHECK (trailing)
     if position['shares'] > 0:
         worst_price = smh_low.iloc[i]
-        
+
         if worst_price <= position['stop_price']:
             pnl = position['shares'] * (position['stop_price'] - position['entry'])
             equity += pnl
-            
+
             trades.append({
                 'date': date,
                 'action': 'STOP',
@@ -58,16 +58,16 @@ for i in range(125, len(df)):
                 'stop': position['stop_price'],
                 'pnl': pnl
             })
-            
+
             position = {'shares': 0, 'entry': 0, 'stop_price': 0}
             stop_count += 1
-    
+
     # BEAR EXIT
     if position['shares'] > 0 and not bull.iloc[i]:
         exit_price = smh_close.iloc[i]
         pnl = position['shares'] * (exit_price - position['entry'])
         equity += pnl
-        
+
         trades.append({
             'date': date,
             'action': 'BEAR_EXIT',
@@ -75,25 +75,25 @@ for i in range(125, len(df)):
             'exit': exit_price,
             'pnl': pnl
         })
-        
+
         position = {'shares': 0, 'entry': 0, 'stop_price': 0}
         bear_exit_count += 1
-    
+
     # ENTRY
     if position['shares'] == 0 and bull.iloc[i]:
         vix = vix_close.iloc[i]
         lev = get_leverage(vix)
         entry_price = smh_close.iloc[i]
         shares = int((equity * lev) / entry_price)
-        
+
         initial_stop = entry_price * (1 - STOP_PCT)
-        
+
         position = {
             'shares': shares,
             'entry': entry_price,
             'stop_price': initial_stop
         }
-        
+
         trades.append({
             'date': date,
             'action': 'ENTER',
@@ -101,22 +101,22 @@ for i in range(125, len(df)):
             'leverage': lev,
             'stop': initial_stop
         })
-    
+
     # TRAILING STOP (move UP only at close)
     if position['shares'] > 0:
         close = smh_close.iloc[i]
         new_stop = close * (1 - STOP_PCT)
-        
+
         if new_stop > position['stop_price']:
             position['stop_price'] = new_stop
-    
+
     # EOD EQUITY
     if position['shares'] > 0:
         unrealized = position['shares'] * (smh_close.iloc[i] - position['entry'])
         total_equity = equity + unrealized
     else:
         total_equity = equity
-    
+
     equity_series.append(total_equity)
     dates_list.append(date)
 
