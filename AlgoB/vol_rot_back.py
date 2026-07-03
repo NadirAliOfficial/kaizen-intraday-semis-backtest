@@ -79,12 +79,12 @@ for i in range(125, len(df)):
             # CAP loss at exactly -2%
             pnl = -(day_start_equity * 0.02)
             equity = day_start_equity + pnl  # = day_start * 0.98
-            
+
             trades.append({'date': date, 'action': 'STOP', 'asset': position['asset'],
                            'entry': position['entry'], 'close': pos_close,
                            'shares': position['shares'], 'pnl': pnl,
                            'actual_dd_%': equity_dd * 100, 'capped_dd_%': -2.0})
-            
+
             position = {'asset': None, 'shares': 0, 'entry': 0}
 
     # === BEAR EXIT ===
@@ -93,11 +93,11 @@ for i in range(125, len(df)):
         pos_close = smh_close.iloc[i] if position['asset'] == 'SMH' else soxx_close.iloc[i]
         pnl = position['shares'] * (pos_close - position['entry'])
         equity += pnl
-        
+
         trades.append({'date': date, 'action': 'BEAR_EXIT', 'asset': position['asset'],
                        'entry': position['entry'], 'close': pos_close,
                        'shares': position['shares'], 'pnl': pnl})
-        
+
         position = {'asset': None, 'shares': 0, 'entry': 0}
 
     # === ENTER (only if no position, not stopped, and bull) ===
@@ -107,7 +107,7 @@ for i in range(125, len(df)):
         asset_open = smh_open.iloc[i] if selected_asset == 'SMH' else soxx_open.iloc[i]
         entry_price = asset_open if not pd.isna(asset_open) else asset_close
         shares = (equity * lev) / entry_price
-        
+
         position = {'asset': selected_asset, 'shares': shares, 'entry': entry_price}
         trades.append({'date': date, 'action': 'ENTER', 'asset': selected_asset,
                        'entry': entry_price, 'shares': shares, 'lev': lev, 'pnl': None})
