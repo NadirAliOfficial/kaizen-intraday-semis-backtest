@@ -93,7 +93,7 @@ class ProductionSystem:
         self.ib = None
         self.smh = Stock(SYMBOL, EXCHANGE, "USD")
         self.vix = Index('VIX', 'CBOE')
-        
+
         self.position_qty = 0
         self.position_entry = 0
         self.stop_order_id = None
@@ -104,9 +104,9 @@ class ProductionSystem:
         self._entered_today = False
         self._close_done_today = False
         self._pending_trade = None  # track MOC trade for fill checking
-        
+
         self.connect()
-    
+
     def connect(self):
         """Connect to IBKR — retries indefinitely every 10-15s"""
         attempt = 0
@@ -134,11 +134,11 @@ class ProductionSystem:
                 if attempt == 1:
                     tg(f"🔴 <b>Disconnected</b>\nCannot connect to IBKR. Retrying every {delay}s...\nError: {e}")
                 time.sleep(delay)
-    
+
     def initialize_emas(self):
         """Load 250 bars"""
         log.info("Loading 250 bars...")
-        
+
         bars = self.ib.reqHistoricalData(
             self.smh,
             endDateTime='',
@@ -147,43 +147,43 @@ class ProductionSystem:
             whatToShow='TRADES',
             useRTH=True
         )
-        
+
         df = util.df(bars)
         df['ema_25'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
         df['ema_125'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
-        
+
         self.ema_25 = df['ema_25'].iloc[-1]
         self.ema_125 = df['ema_125'].iloc[-1]
         self.bull_signal = self.ema_25 > self.ema_125
         self.last_known_price = df['close'].iloc[-1]
-        
+
         log.info(f"✅ EMAs: {self.ema_25:.2f} / {self.ema_125:.2f} | {'BULL' if self.bull_signal else 'BEAR'}")
-    
+
     def sync_position(self):
         """Detect existing position and synchronize stops"""
         positions = self.ib.positions()
         has_position = False
-        
+
         for pos in positions:
             if pos.contract.symbol == SYMBOL:
                 self.position_qty = pos.position
                 has_position = True
-                
+
                 portfolio = self.ib.portfolio()
                 for item in portfolio:
                     if item.contract.symbol == SYMBOL:
                         self.position_entry = item.averageCost
                         break
-                
+
                 log.info(f"📍 Position: {self.position_qty} @ ${self.position_entry:.2f}")
                 break
-        
+
         # Synchronize stops with IBKR
         self.sync_stops(has_position)
-        
+
         if not has_position:
             log.info("📍 No position")
-    
+
     def sync_stops(self, has_position):
         """Synchronize stop orders with IBKR state"""
         try:
@@ -211,10 +211,10 @@ class ProductionSystem:
                 for stop in smh_stops:
                     self.ib.cancelOrder(stop.order)
                     log.warning(f"⚠️  Cancelled orphan stop")
-                    
+
         except Exception as e:
             log.error(f"Stop sync error: {e}")
-    
+
     def get_account_value(self):
         """Get NetLiquidation (any currency — account is EUR-denominated)"""
         account = getattr(self, '_account', '')
@@ -235,7 +235,7 @@ class ProductionSystem:
 
         log.error("❌ Could not fetch account value after 3 attempts")
         return 0
-    
+
     def get_vix(self):
         """Get VIX"""
         try:
@@ -246,11 +246,11 @@ class ProductionSystem:
             return vix if vix > 0 else 15.0
         except Exception:
             return 15.0
-    
+
     def get_leverage(self):
         """VIX-based leverage"""
         vix = self.get_vix()
-        
+
         if vix < 12:
             lev = LEV_VIX_12
         elif vix < 13:
@@ -259,24 +259,24 @@ class ProductionSystem:
             lev = LEV_VIX_14
         else:
             lev = LEV_BASE
-        
+
         log.info(f"   VIX: {vix:.2f} → {lev}x")
         return lev
-    
+
     def update_emas(self, price):
         """Update EMAs"""
         k_fast = 2 / (EMA_FAST + 1)
         k_slow = 2 / (EMA_SLOW + 1)
-        
+
         self.ema_25 = price * k_fast + self.ema_25 * (1 - k_fast)
         self.ema_125 = price * k_slow + self.ema_125 * (1 - k_slow)
-        
+
         prev = self.bull_signal
         self.bull_signal = self.ema_25 > self.ema_125
-        
+
         if prev != self.bull_signal:
             log.info(f"📊 SIGNAL: {'BULL' if self.bull_signal else 'BEAR'}")
-    
+
     def place_order(self, action, qty):
         """Place MOC order (falls back to MKT if past 15:45 ET)"""
         try:
@@ -330,7 +330,7 @@ class ProductionSystem:
             log.error(f"Order error: {e}")
             self._pending_trade = None
             return None
-    
+
     def place_stop(self, qty, stop_price):
         """IBKR stop order"""
         try:
@@ -340,15 +340,15 @@ class ProductionSystem:
             order.orderType = "STP"
             order.auxPrice = stop_price
             order.tif = "GTC"
-            
+
             trade = self.ib.placeOrder(self.smh, order)
             self.stop_order_id = trade.order.orderId
-            
+
             log.info(f"🛡️  Stop @ ${stop_price:.2f}")
-            
+
         except Exception as e:
             log.error(f"Stop error: {e}")
-    
+
     def cancel_stop(self):
         """Cancel stop by finding the matching trade"""
         if not self.stop_order_id:
@@ -363,7 +363,7 @@ class ProductionSystem:
         except Exception as e:
             log.error(f"Cancel stop error: {e}")
             self.stop_order_id = None
-    
+
     def check_stop_triggered(self):
         """Check if IBKR stop hit — handles full and partial exits"""
         if not self.stop_order_id:
@@ -400,7 +400,7 @@ class ProductionSystem:
             log.error(f"Error checking stop: {e}")
 
         return False
-    
+
     def check_pending_fill(self):
         """Check if a pending MOC/MKT order has filled"""
         if not self._pending_trade:
@@ -478,7 +478,7 @@ class ProductionSystem:
 
         except Exception as e:
             log.error(f"Entry error: {e}")
-    
+
     def exit(self, reason):
         """Exit position"""
         if self.position_qty == 0:
@@ -504,7 +504,7 @@ class ProductionSystem:
 
         except Exception as e:
             log.error(f"Exit error: {e}")
-    
+
     def daily_cycle(self):
         """Main loop"""
         try:
@@ -664,7 +664,7 @@ class ProductionSystem:
 
         except Exception as e:
             log.error(f"Cycle error: {e}")
-    
+
     def _show_countdown(self):
         """Show live countdown to next entry on a single line"""
         from datetime import timedelta
