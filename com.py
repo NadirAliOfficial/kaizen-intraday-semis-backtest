@@ -20,59 +20,59 @@ def run_backtest(stop_pct, buffer_pct, name):
     equity_series = []
     equity = 100000.0
     position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
-    
+
     stop_count = 0
     bear_exit_count = 0
     entry_count = 0
-    
+
     # Effective stop = stop_pct + buffer_pct
     effective_stop = stop_pct + buffer_pct
-    
+
     for i in range(125, len(df)):
         if pd.isna(smh_close.iloc[i]) or pd.isna(vix_close.iloc[i]):
             continue
-        
+
         # STOP CHECK
         if position['shares'] > 0:
             worst_price = smh_low.iloc[i]
             worst_equity = position['entry_equity'] + position['shares'] * (worst_price - position['entry'])
             dd = (worst_equity - position['entry_equity']) / position['entry_equity']
-            
+
             if dd <= -effective_stop:
                 pnl = -(position['entry_equity'] * stop_pct)
                 equity = position['entry_equity'] + pnl
                 position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
                 stop_count += 1
-        
+
         # BEAR EXIT
         if position['shares'] > 0 and not bull.iloc[i]:
             pnl = position['shares'] * (smh_close.iloc[i] - position['entry'])
             equity = position['entry_equity'] + pnl
             position = {'shares': 0, 'entry': 0, 'entry_equity': 0}
             bear_exit_count += 1
-        
+
         # ENTRY
         if position['shares'] == 0 and bull.iloc[i]:
             vix = vix_close.iloc[i]
             lev = 3.75 if vix < 12 else (3.5 if vix < 13 else (3.25 if vix < 14 else 3.0))
-            
+
             entry_price = smh_close.iloc[i]
             shares = (equity * lev) / entry_price
             position = {'shares': shares, 'entry': entry_price, 'entry_equity': equity}
             entry_count += 1
-        
+
         # EOD
         eod_equity = equity + (position['shares'] * (smh_close.iloc[i] - position['entry']) if position['shares'] > 0 else 0)
         equity_series.append(eod_equity)
-    
+
     # Stats
     equity_array = np.array(equity_series)
     initial = equity_array[0]
     final = equity_array[-1]
-    
+
     years = len(equity_array) / 252
     cagr = (pow(final / initial, 1/years) - 1) * 100
-    
+
     peak = equity_array[0]
     max_dd = 0
     for e in equity_array:
@@ -81,9 +81,9 @@ def run_backtest(stop_pct, buffer_pct, name):
         dd = (peak - e) / peak * 100
         if dd > max_dd:
             max_dd = dd
-    
+
     mar = cagr / max_dd if max_dd > 0 else 0
-    
+
     return {
         'name': name,
         'stop_%': stop_pct * 100,
@@ -107,7 +107,7 @@ results = []
 for stop_pct, name in [(0.018, "1.8%"), (0.020, "2.0%"), (0.0215, "2.15%")]:
     result = run_backtest(stop_pct, 0.001, name)  # 0.1% buffer
     results.append(result)
-    
+
     print(f"\n{name} Stop (Effective {result['effective_%']:.2f}%):")
     print(f"  CAGR: {result['cagr']:.2f}%")
     print(f"  Max DD: {result['max_dd']:.2f}%")
