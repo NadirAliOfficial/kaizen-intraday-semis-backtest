@@ -40,27 +40,27 @@ print(f"Strategy: EMA 25/125 Crossover\n")
 # Main loop (start after EMA warmup)
 for i in range(125, len(df)):
     date = df.index[i]
-    
+
     if pd.isna(smh_close.iloc[i]) or pd.isna(vix.iloc[i]) or pd.isna(ema_fast.iloc[i]) or pd.isna(ema_slow.iloc[i]):
         continue
-    
+
     # Update equity
     if position['long_shares'] > 0:
         long_pnl = position['long_shares'] * (smh_close.iloc[i] - position['long_entry'])
         equity = initial_capital + long_pnl
-        
+
         if position['short_shares'] > 0:
             short_pnl = position['short_shares'] * (position['short_entry'] - soxl.iloc[i])
             equity += short_pnl
     else:
         equity = initial_capital
-    
+
     equity_curve.append({
         'date': date, 'equity': equity, 'smh': smh_close.iloc[i], 'vix': vix.iloc[i],
         'ema_fast': ema_fast.iloc[i], 'ema_slow': ema_slow.iloc[i], 'bull': bull.iloc[i],
         'long_shares': position['long_shares'], 'short_shares': position['short_shares']
     })
-    
+
     # 1. Check stop loss
     if position['long_shares'] > 0 and not pd.isna(prev_close.iloc[i]):
         dd = (smh_close.iloc[i] - prev_close.iloc[i]) / prev_close.iloc[i]
@@ -68,15 +68,15 @@ for i in range(125, len(df)):
             pnl = position['long_shares'] * (smh_close.iloc[i] - position['long_entry'])
             trades.append({
                 'date': date, 'action': 'STOP_LOSS_LONG', 'asset': 'SMH',
-                'entry_price': position['long_entry'], 'exit_price': smh_close.iloc[i], 
-                'shares': position['long_shares'], 'pnl': pnl, 'dd_pct': dd * 100, 
+                'entry_price': position['long_entry'], 'exit_price': smh_close.iloc[i],
+                'shares': position['long_shares'], 'pnl': pnl, 'dd_pct': dd * 100,
                 'bull': bull.iloc[i], 'equity_before': equity
             })
             initial_capital += pnl
             equity = initial_capital
             position['long_shares'] = 0
             position['long_entry'] = 0
-    
+
     # 2. Enter long if bull market and no position
     if position['long_shares'] == 0 and bull.iloc[i]:
         if vix.iloc[i] < 13:
@@ -85,26 +85,26 @@ for i in range(125, len(df)):
             lev = 3.25
         else:
             lev = 3.0
-        
+
         notional = equity * lev
         shares = notional / smh_close.iloc[i]
         position['long_shares'] = shares
         position['long_entry'] = smh_close.iloc[i]
-        
+
         trades.append({
             'date': date, 'action': 'ENTER_LONG', 'asset': 'SMH',
-            'entry_price': smh_close.iloc[i], 'exit_price': None, 'shares': shares, 
+            'entry_price': smh_close.iloc[i], 'exit_price': None, 'shares': shares,
             'notional': notional, 'leverage': lev, 'vix': vix.iloc[i], 'gap_up': gap_up.iloc[i],
-            'ema_fast': ema_fast.iloc[i], 'ema_slow': ema_slow.iloc[i], 'pnl': None, 
+            'ema_fast': ema_fast.iloc[i], 'ema_slow': ema_slow.iloc[i], 'pnl': None,
             'equity_before': equity
         })
-    
+
     # 3. Exit long if bear market
     if position['long_shares'] > 0 and not bull.iloc[i]:
         pnl = position['long_shares'] * (smh_close.iloc[i] - position['long_entry'])
         trades.append({
             'date': date, 'action': 'EXIT_LONG_BEAR', 'asset': 'SMH',
-            'entry_price': position['long_entry'], 'exit_price': smh_close.iloc[i], 
+            'entry_price': position['long_entry'], 'exit_price': smh_close.iloc[i],
             'shares': position['long_shares'], 'pnl': pnl,
             'ema_fast': ema_fast.iloc[i], 'ema_slow': ema_slow.iloc[i],
             'equity_before': equity
@@ -113,31 +113,31 @@ for i in range(125, len(df)):
         equity = initial_capital
         position['long_shares'] = 0
         position['long_entry'] = 0
-    
+
     # 4. Enter short
     if not pd.isna(vix_chg.iloc[i]) and not pd.isna(smh_ret.iloc[i]):
         if vix_chg.iloc[i] >= 0.02 and smh_ret.iloc[i] <= -0.005 and position['short_shares'] == 0:
             short_lev = 1.5 if vix.iloc[i] >= 22 else 1.0
             short_notional = equity * short_lev
             short_shares = short_notional / soxl.iloc[i]
-            
+
             position['short_shares'] = short_shares
             position['short_entry'] = soxl.iloc[i]
-            
+
             trades.append({
                 'date': date, 'action': 'ENTER_SHORT', 'asset': 'SOXL',
-                'entry_price': soxl.iloc[i], 'exit_price': None, 'shares': short_shares, 
-                'notional': short_notional, 'leverage': short_lev, 'vix': vix.iloc[i], 
+                'entry_price': soxl.iloc[i], 'exit_price': None, 'shares': short_shares,
+                'notional': short_notional, 'leverage': short_lev, 'vix': vix.iloc[i],
                 'vix_chg_pct': vix_chg.iloc[i] * 100, 'smh_ret_pct': smh_ret.iloc[i] * 100,
                 'bull': bull.iloc[i], 'pnl': None, 'equity_before': equity
             })
-    
+
     # 5. Exit short, re-enter long if bull
     if position['short_shares'] > 0:
         pnl = position['short_shares'] * (position['short_entry'] - soxl.iloc[i])
         trades.append({
             'date': date, 'action': 'EXIT_SHORT', 'asset': 'SOXL',
-            'entry_price': position['short_entry'], 'exit_price': soxl.iloc[i], 
+            'entry_price': position['short_entry'], 'exit_price': soxl.iloc[i],
             'shares': position['short_shares'], 'pnl': pnl, 'bull': bull.iloc[i],
             'equity_before': equity
         })
@@ -145,7 +145,7 @@ for i in range(125, len(df)):
         equity = initial_capital
         position['short_shares'] = 0
         position['short_entry'] = 0
-        
+
         # Re-enter long if bull
         if bull.iloc[i] and position['long_shares'] == 0:
             if vix.iloc[i] < 13:
@@ -154,16 +154,16 @@ for i in range(125, len(df)):
                 lev = 3.25
             else:
                 lev = 3.0
-            
+
             notional = equity * lev
             shares = notional / smh_close.iloc[i]
             position['long_shares'] = shares
             position['long_entry'] = smh_close.iloc[i]
-            
+
             trades.append({
                 'date': date, 'action': 'REENTER_LONG', 'asset': 'SMH',
-                'entry_price': smh_close.iloc[i], 'exit_price': None, 'shares': shares, 
-                'notional': notional, 'leverage': lev, 'vix': vix.iloc[i], 'pnl': None, 
+                'entry_price': smh_close.iloc[i], 'exit_price': None, 'shares': shares,
+                'notional': notional, 'leverage': lev, 'vix': vix.iloc[i], 'pnl': None,
                 'equity_before': equity
             })
 
@@ -236,7 +236,7 @@ if len(trades_with_pnl) > 0:
         print(f"  Total Losses: ${losing_trades['pnl'].sum():,.2f}")
     print(f"  Largest Win: ${trades_with_pnl['pnl'].max():,.2f}")
     print(f"  Largest Loss: ${trades_with_pnl['pnl'].min():,.2f}")
-    
+
     if len(winning_trades) > 0 and len(losing_trades) > 0:
         profit_factor = abs(winning_trades['pnl'].sum() / losing_trades['pnl'].sum())
         print(f"  Profit Factor: {profit_factor:.2f}")
