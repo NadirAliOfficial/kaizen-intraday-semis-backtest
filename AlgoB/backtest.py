@@ -34,46 +34,46 @@ print(f"Starting backtest with ${initial_capital:,.0f}...\n")
 # Main loop
 for i in range(1, len(df)):
     date = df.index[i]
-    
+
     # Skip if we have NaN values
     if pd.isna(smh.iloc[i]) or pd.isna(vix.iloc[i]):
         continue
-    
+
     # Update equity from existing positions
     if position['long_shares'] > 0:
         long_pnl = position['long_shares'] * (smh.iloc[i] - position['long_entry'])
         equity = initial_capital + long_pnl
-        
+
         # Add short P&L if exists
         if position['short_shares'] > 0:
             short_pnl = position['short_shares'] * (position['short_entry'] - soxl.iloc[i])
             equity += short_pnl
     else:
         equity = initial_capital
-    
+
     equity_curve.append({
-        'date': date, 
-        'equity': equity, 
-        'smh': smh.iloc[i], 
+        'date': date,
+        'equity': equity,
+        'smh': smh.iloc[i],
         'vix': vix.iloc[i],
         'long_shares': position['long_shares'],
         'short_shares': position['short_shares']
     })
-    
+
     # 1. Check daily stop loss on long position
     if position['long_shares'] > 0 and not pd.isna(prev_close.iloc[i]):
         dd = (smh.iloc[i] - prev_close.iloc[i]) / prev_close.iloc[i]
         if dd <= -0.02:
             pnl = position['long_shares'] * (smh.iloc[i] - position['long_entry'])
             trades.append({
-                'date': date, 
-                'action': 'STOP_LOSS_LONG', 
+                'date': date,
+                'action': 'STOP_LOSS_LONG',
                 'asset': 'SMH',
                 'entry_price': position['long_entry'],
-                'exit_price': smh.iloc[i], 
+                'exit_price': smh.iloc[i],
                 'shares': position['long_shares'],
-                'pnl': pnl, 
-                'dd_pct': dd * 100, 
+                'pnl': pnl,
+                'dd_pct': dd * 100,
                 'equity_before': equity
             })
             # Realize P&L
@@ -81,7 +81,7 @@ for i in range(1, len(df)):
             equity = initial_capital
             position['long_shares'] = 0
             position['long_entry'] = 0
-    
+
     # 2. Enter long if no position
     if position['long_shares'] == 0:
         # Determine leverage
@@ -91,64 +91,64 @@ for i in range(1, len(df)):
             lev = 3.25
         else:
             lev = 3.0
-        
+
         # Calculate position size based on current equity
         notional = equity * lev
         shares = notional / smh.iloc[i]
         position['long_shares'] = shares
         position['long_entry'] = smh.iloc[i]
-        
+
         trades.append({
-            'date': date, 
-            'action': 'ENTER_LONG', 
+            'date': date,
+            'action': 'ENTER_LONG',
             'asset': 'SMH',
             'entry_price': smh.iloc[i],
             'exit_price': None,
-            'shares': shares, 
+            'shares': shares,
             'notional': notional,
             'leverage': lev,
-            'vix': vix.iloc[i], 
-            'pnl': None, 
+            'vix': vix.iloc[i],
+            'pnl': None,
             'equity_before': equity
         })
-    
+
     # 3. Check short entry conditions
     if not pd.isna(vix_chg.iloc[i]) and not pd.isna(smh_ret.iloc[i]):
         if vix_chg.iloc[i] >= 0.02 and smh_ret.iloc[i] <= -0.005 and position['short_shares'] == 0:
             short_lev = 1.5 if vix.iloc[i] >= 22 else 1.0
             short_notional = equity * short_lev
             short_shares = short_notional / soxl.iloc[i]
-            
+
             position['short_shares'] = short_shares
             position['short_entry'] = soxl.iloc[i]
-            
+
             trades.append({
-                'date': date, 
-                'action': 'ENTER_SHORT', 
+                'date': date,
+                'action': 'ENTER_SHORT',
                 'asset': 'SOXL',
                 'entry_price': soxl.iloc[i],
                 'exit_price': None,
-                'shares': short_shares, 
+                'shares': short_shares,
                 'notional': short_notional,
                 'leverage': short_lev,
-                'vix': vix.iloc[i], 
-                'vix_chg_pct': vix_chg.iloc[i] * 100, 
-                'smh_ret_pct': smh_ret.iloc[i] * 100, 
-                'pnl': None, 
+                'vix': vix.iloc[i],
+                'vix_chg_pct': vix_chg.iloc[i] * 100,
+                'smh_ret_pct': smh_ret.iloc[i] * 100,
+                'pnl': None,
                 'equity_before': equity
             })
-    
+
     # 4. Exit short at close (same day)
     if position['short_shares'] > 0:
         pnl = position['short_shares'] * (position['short_entry'] - soxl.iloc[i])
         trades.append({
-            'date': date, 
-            'action': 'EXIT_SHORT', 
+            'date': date,
+            'action': 'EXIT_SHORT',
             'asset': 'SOXL',
             'entry_price': position['short_entry'],
-            'exit_price': soxl.iloc[i], 
+            'exit_price': soxl.iloc[i],
             'shares': position['short_shares'],
-            'pnl': pnl, 
+            'pnl': pnl,
             'equity_before': equity
         })
         # Realize short P&L
@@ -224,7 +224,7 @@ if len(trades_with_pnl) > 0:
         print(f"  Total Losses: ${losing_trades['pnl'].sum():,.2f}")
     print(f"  Largest Win: ${trades_with_pnl['pnl'].max():,.2f}")
     print(f"  Largest Loss: ${trades_with_pnl['pnl'].min():,.2f}")
-    
+
     if len(winning_trades) > 0 and len(losing_trades) > 0:
         profit_factor = abs(winning_trades['pnl'].sum() / losing_trades['pnl'].sum())
         print(f"  Profit Factor: {profit_factor:.2f}")
